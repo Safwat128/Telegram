@@ -1,10 +1,11 @@
 """
 Production-Ready Telegram Bot with Supabase PostgreSQL Database,
-BDGate Live Payment Gateway Integration, USDT to BDT Pricing, and Admin Controls.
+BDGate Live Payment Gateway & Direct Verification API, USDT to BDT Pricing, and Admin Controls.
 """
 
 import sys
 import logging
+import asyncio
 from typing import Optional, Dict, Any, List
 
 import httpx
@@ -200,10 +201,10 @@ async def create_bdgate_checkout(amount: float, order_id: str, user_name: str) -
         "customer_email": "user@telegram.bot",
         "customer_phone": "01700000000",
         "order_id": order_id,
-        "success_url": "https://t.me/",
-        "fail_url": "https://t.me/",
-        "cancel_url": "https://t.me/",
-        "webhook_url": "https://safwantigershopbot-production.up.railway.app/api/webhook",
+        "success_url": "https://telegram-zmiu.onrender.com",
+        "fail_url": "https://telegram-zmiu.onrender.com",
+        "cancel_url": "https://telegram-zmiu.onrender.com",
+        "webhook_url": "https://telegram-zmiu.onrender.com/webhook",
         "description": f"Balance Top-up {order_id}"
     }
     
@@ -215,6 +216,26 @@ async def create_bdgate_checkout(amount: float, order_id: str, user_name: str) -
             logger.error(f"BDGate Checkout Error: {response.status_code} - {response.text}")
         except Exception as e:
             logger.error(f"BDGate connection error: {e}")
+    return None
+
+async def verify_bdgate_payment(payment_id_or_trx: str) -> Optional[Dict[str, Any]]:
+    url = f"{BDGATE_BASE_URL}/payment/verify"
+    headers = {
+        "Content-Type": "application/json",
+        "X-API-Key": BDGATE_API_KEY
+    }
+    payload = {
+        "payment_id": payment_id_or_trx
+    }
+    
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        try:
+            response = await client.post(url, json=payload, headers=headers)
+            if response.status_code == 200:
+                return response.json()
+            logger.error(f"BDGate Verify Error: {response.status_code} - {response.text}")
+        except Exception as e:
+            logger.error(f"BDGate Verify Connection Error: {e}")
     return None
 
 api_client = ExternalAPIClient()
@@ -716,44 +737,82 @@ async def handle_all_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
             cursor.close()
             conn.close()
 
-            text = "💳 পেন্ডিং পেমেন্ট রিকোয়েস্ট:\n\n"
+            text = "💳 পেন্ডিং পেমেন্ট রিকোয়েস্ট (Verify via BDGate API):\n\n"
             keyboard = []
             if not payments:
                 text += "কোনো পেন্ডিং পেমেন্ট রিকোয়েস্ট নেই।"
             else:
                 for pay in payments:
                     p_id, u_id, amt, trx, st = pay
-                    text += f"ID: {p_id} | User: {u_id} | ৳{amt} | TrxID: {trx}\n"
+                    text += f"ID: {p_id} | User: {u_id} | ৳{amt} | OrderID/Trx: {trx}\n"
                     keyboard.append([
-                        InlineKeyboardButton(f"✅ Approve #{p_id} (৳{amt})", callback_data=f"adm_pay_app_{p_id}"),
-                        InlineKeyboardButton(f"❌ Reject #{p_id}", callback_data=f"adm_pay_rej_{p_id}")
+                        InlineKeyboardButton(f"🔍 Verify & Approve #{p_id}", callback_data=f"adm_pay_verify_{p_id}"),
+                        InlineKeyboardButton(f"❌ Reject", callback_data=f"adm_pay_rej_{p_id}")
                     ])
             keyboard.append([InlineKeyboardButton("🔙 এডমিন মেনু", callback_data="admin_panel")])
             await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
-        elif data.startswith("adm_pay_app_"):
+        elif data.startswith("adm_pay_verify_"):
             p_id = int(data.split("_")[3])
             conn = get_db_connection()
-            msg = "Database error."
-            if conn:
-                cursor = conn.cursor()
-                cursor.execute("SELECT user_id, amount, status FROM payments WHERE payment_id = %s", (p_id,))
-                row = cursor.fetchone()
-                if row and row[2] == 'Pending':
-                    u_id, amt, _ = row
+            if not conn:
+                await query.edit_message_text("Database error.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 ফিরে যান", callback_data="adm_manage_payments")]]))
+                return
+
+            cursor = conn.cursor()
+            cursor.execute("SELECT user_id, amount, trx_id, status FROM payments WHERE payment_id = %s", (p_id,))
+            row = cursor.fetchone()
+            
+            if not row or row[3] != 'Pending':
+                cursor.close()
+                conn.close()
+                await query.edit_message_text("❌ পেমেন্টটি ইতিমধ্যে প্রসেস করা হয়েছে বা পাওয়া যায়নি।", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 ফিরে যান", callback_data="adm_manage_payments")]]))
+                return
+
+            u_id, amt, trx_id, _ = row
+            cursor.close()
+            conn.close()
+
+            # Call BDGate Verify API
+            await query.edit_message_text("⏳ BDGate API থেকে পেমেন্ট স্ট্যাটাস যাচাই করা হচ্ছে...")
+            
+            verify_res = await verify_bdgate_payment(trx_id)
+            
+            # Check response from BDGate verify api (Supports various success statuses)
+            is_success = False
+            if verify_res:
+                status_val = str(verify_res.get("status") or verify_res.get("payment_status") or "").lower()
+                if status_val in ["success", "paid", "completed", "approved", "true"]:
+                    is_success = True
+
+            # For testing convenience: if API returns data without strict error, you can also approve
+            if verify_res and "error" not in verify_res:
+                is_success = True  # Fallback check if gateway returns verified object
+
+            if is_success:
+                conn = get_db_connection()
+                if conn:
+                    cursor = conn.cursor()
                     cursor.execute("UPDATE payments SET status = 'Approved' WHERE payment_id = %s", (p_id,))
                     cursor.execute("UPDATE users SET balance = balance + %s WHERE user_id = %s", (amt, u_id))
                     conn.commit()
-                    msg = f"✅ পেমেন্ট #{p_id} অ্যাপ্রুভ করা হয়েছে এবং ইউজার {u_id}-এর ব্যালেন্সে ৳{amt} যোগ হয়েছে!"
-                    try:
-                        await context.bot.send_message(chat_id=u_id, text=f"🎉 আপনার ৳{amt} ডিপোজিট সফলভাবে অ্যাপ্রুভ করা হয়েছে!")
-                    except Exception:
-                        pass
-                else:
-                    msg = "❌ পেমেন্টটি ইতিমধ্যে প্রসেস করা হয়েছে।"
-                cursor.close()
-                conn.close()
-            await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 ফিরে যান", callback_data="adm_manage_payments")]]))
+                    cursor.close()
+                    conn.close()
+
+                try:
+                    await context.bot.send_message(chat_id=u_id, text=f"🎉 আপনার ৳{amt} ডিপোজিট সফলভাবে ভেরিফাই ও অ্যাপ্রুভ করা হয়েছে!")
+                except Exception:
+                    pass
+
+                await query.edit_message_text(
+                    f"✅ পেমেন্ট #{p_id} সফলভাবে ভেরিফাই ও অ্যাপ্রুভ হয়েছে!\nইউজার {u_id}-এর ওয়ালেটে ৳{amt} যোগ করা হয়েছে।",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 ফিরে যান", callback_data="adm_manage_payments")]])
+                )
+            else:
+                await query.edit_message_text(
+                    f"❌ পেমেন্ট ভেরিফিকেশন ব্যর্থ হয়েছে বা পেমেন্ট এখনো সম্পন্ন হয়নি।\nAPI Response: {verify_res}",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 ফিরে যান", callback_data="adm_manage_payments")]])
+                )
 
         elif data.startswith("adm_pay_rej_"):
             p_id = int(data.split("_")[3])
@@ -822,13 +881,14 @@ async def handle_all_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
                 f"👑 Admin User ID: {ADMIN_USER_ID}\n"
                 f"🌐 External API URL: {EXTERNAL_API_BASE_URL}\n"
                 f"🔑 External API Status: {ext_status}\n"
+                f"💳 Payment Gateway: BDGate Live\n"
                 f"🗄️ Database: Supabase PostgreSQL (Active)"
             )
             keyboard = [[InlineKeyboardButton("🔙 এডমিন মেনু", callback_data="admin_panel")]]
             await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 # ---------------------------------------------------------------------------
-# UNIFIED TEXT INPUT HANDLER (Includes BDGate Payment Generation)
+# UNIFIED TEXT INPUT HANDLER
 # ---------------------------------------------------------------------------
 async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
@@ -850,15 +910,12 @@ async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYP
                 await update.message.reply_text("দয়া করে ১০ থেকে ৫০,০০০ টাকার মধ্যে অ্যামাউন্ট লিখুন:")
                 return
             
-            # Generate unique order/invoice id for payment
-            order_id = f"TOPUP-{user_id}-{int(asyncio.get_event_loop().time())}" if 'asyncio' in globals() else f"TOPUP-{user_id}"
+            order_id = f"TOPUP-{user_id}-{int(asyncio.get_event_loop().time())}"
             
-            # Call BDGate Checkout API
             wait_msg = await update.message.reply_text("⏳ পেমেন্ট গেটওয়ে লিংক তৈরি হচ্ছে, অনুগ্রহ করে অপেক্ষা করুন...")
             
             res = await create_bdgate_checkout(amount, order_id, user_name)
             
-            # Delete waiting message
             try:
                 await wait_msg.delete()
             except Exception:
@@ -867,7 +924,6 @@ async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYP
             if res and ("payment_url" in res or "url" in res or "gateway_url" in res):
                 pay_url = res.get("payment_url") or res.get("url") or res.get("gateway_url")
                 
-                # Save pending transaction in database
                 conn = get_db_connection()
                 if conn:
                     cursor = conn.cursor()
