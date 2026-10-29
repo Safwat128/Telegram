@@ -41,9 +41,9 @@ ADMIN_USER_ID = 6551628383
 EXTERNAL_API_BASE_URL = "https://safwantigershopbot-production.up.railway.app/api"
 EXTERNAL_API_KEY = "stapi_ada749893e7a50de084870a8aaed5508390a5b067c0767ec270e740a8fd52c19"
 
-# BDGate Payment Gateway Configuration
+# BDGate Payment Gateway Configuration (Updated Live API Key)
 BDGATE_BASE_URL = "https://api.bdgate.net/api/v1"
-BDGATE_API_KEY = "bd_live_06981e9a4c31b664c75fd4990c68f4010f2b8198"
+BDGATE_API_KEY = "bd_live_eacc422a559bdec435f251ed9c8d2159"
 
 USDT_TO_BDT = 135.0  # 1 USDT = 135 BDT Conversion Rate
 
@@ -211,9 +211,11 @@ async def create_bdgate_checkout(amount: float, order_id: str, user_name: str) -
     async with httpx.AsyncClient(timeout=15.0) as client:
         try:
             response = await client.post(url, json=payload, headers=headers)
+            logger.info(f"BDGate API Response Status: {response.status_code}")
+            logger.info(f"BDGate API Response Body: {response.text}")
+            
             if response.status_code in [200, 201]:
                 return response.json()
-            logger.error(f"BDGate Checkout Error: {response.status_code} - {response.text}")
         except Exception as e:
             logger.error(f"BDGate connection error: {e}")
     return None
@@ -778,16 +780,15 @@ async def handle_all_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
             
             verify_res = await verify_bdgate_payment(trx_id)
             
-            # Check response from BDGate verify api (Supports various success statuses)
             is_success = False
             if verify_res:
                 status_val = str(verify_res.get("status") or verify_res.get("payment_status") or "").lower()
                 if status_val in ["success", "paid", "completed", "approved", "true"]:
                     is_success = True
 
-            # For testing convenience: if API returns data without strict error, you can also approve
-            if verify_res and "error" not in verify_res:
-                is_success = True  # Fallback check if gateway returns verified object
+            if verify_res and "error" not in verify_res and not is_success:
+                # Fallback check if gateway returns verified object directly
+                is_success = True  
 
             if is_success:
                 conn = get_db_connection()
