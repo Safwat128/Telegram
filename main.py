@@ -1,14 +1,15 @@
 """
-Production-Ready Telegram Bot for Digital Product Delivery & Secure Payments.
-Includes User Messaging from Admin Panel, USDT to BDT Converted Pricing, and Fixed Telegram Polling.
+Production-Ready Telegram Bot with Supabase PostgreSQL Database,
+External API Integration, USDT to BDT Pricing, and Admin Controls.
 """
 
 import sys
-import sqlite3
 import logging
 from typing import Optional, Dict, Any, List
 
 import httpx
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from telegram import (
     Update,
     InlineKeyboardButton,
@@ -33,12 +34,15 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# CONFIGURATION & CREDENTIALS
+# CONFIGURATION & CREDENTIALS (Pre-configured)
 # ---------------------------------------------------------------------------
 BOT_TOKEN = "8307223176:AAFj-2H86Ma6JmF_Zv1oYIPy0V3O15N-v5c"
 ADMIN_USER_ID = 6551628383
 EXTERNAL_API_BASE_URL = "https://safwantigershopbot-production.up.railway.app/api"
 EXTERNAL_API_KEY = "stapi_ada749893e7a50de084870a8aaed5508390a5b067c0767ec270e740a8fd52c19"
+
+# Supabase PostgreSQL Database URL
+DATABASE_URL = "postgresql://postgres.zrvbpbslnuvnagtpbpsa:KW5DFquJJ5mPregz@aws-1-eu-central-1.pooler.supabase.com:5432/postgres"
 
 USDT_TO_BDT = 135.0  # 1 USDT = 135 BDT Conversion Rate
 
@@ -47,17 +51,27 @@ if not BOT_TOKEN:
     sys.exit(1)
 
 # ---------------------------------------------------------------------------
-# DATABASE INITIALIZATION
+# DATABASE INITIALIZATION (Supabase PostgreSQL)
 # ---------------------------------------------------------------------------
-DB_PATH = "bot_database.db"
+def get_db_connection():
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        return conn
+    except Exception as e:
+        logger.error(f"Database connection error: {e}")
+        return None
 
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
+    if not conn:
+        logger.error("Failed to connect to Supabase database during init.")
+        return
+    
     cursor = conn.cursor()
     
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
+            user_id BIGINT PRIMARY KEY,
             username TEXT,
             first_name TEXT,
             balance REAL DEFAULT 0.0,
@@ -67,7 +81,7 @@ def init_db():
     
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS local_products (
-            product_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            product_id SERIAL PRIMARY KEY,
             name TEXT NOT NULL,
             description TEXT,
             price REAL NOT NULL,
@@ -79,9 +93,9 @@ def init_db():
     
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS stock_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             product_id INTEGER,
-            admin_id INTEGER,
+            admin_id BIGINT,
             quantity_change INTEGER,
             reason TEXT,
             timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -90,10 +104,10 @@ def init_db():
     
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS orders (
-            order_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
+            order_id SERIAL PRIMARY KEY,
+            user_id BIGINT,
             product_type TEXT,
-            product_id INTEGER,
+            product_id TEXT,
             product_name TEXT,
             amount REAL,
             status TEXT,
@@ -104,8 +118,8 @@ def init_db():
 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS payments (
-            payment_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
+            payment_id SERIAL PRIMARY KEY,
+            user_id BIGINT,
             amount REAL,
             method TEXT,
             trx_id TEXT,
@@ -115,8 +129,9 @@ def init_db():
     """)
     
     conn.commit()
+    cursor.close()
     conn.close()
-    logger.info("Database initialized successfully.")
+    logger.info("Supabase PostgreSQL Database initialized successfully.")
 
 init_db()
 
@@ -177,19 +192,28 @@ api_client = ExternalAPIClient()
 # DATABASE HELPERS
 # ---------------------------------------------------------------------------
 def get_user_balance(user_id: int) -> float:
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
+    if not conn:
+        return 0.0
     cursor = conn.cursor()
-    cursor.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,))
+    cursor.execute("SELECT balance FROM users WHERE user_id = %s", (user_id,))
     row = cursor.fetchone()
+    cursor.close()
     conn.close()
     return row[0] if row else 0.0
 
 def register_user_if_not_exists(user_id: int, username: str, first_name: str):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
+    if not conn:
+        return
     cursor = conn.cursor()
-    cursor.execute("INSERT OR IGNORE INTO users (user_id, username, first_name) VALUES (?, ?, ?)", 
-                   (user_id, username, first_name))
+    cursor.execute("""
+        INSERT INTO users (user_id, username, first_name) 
+        VALUES (%s, %s, %s) 
+        ON CONFLICT (user_id) DO NOTHING
+    """, (user_id, username, first_name))
     conn.commit()
+    cursor.close()
     conn.close()
 
 # ---------------------------------------------------------------------------
@@ -260,10 +284,14 @@ async def handle_all_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     elif data == "browse_products":
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_db_connection()
+        if not conn:
+            await query.edit_message_text("Database error.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 ফিরে যান", callback_data="main_menu")]]))
+            return
         cursor = conn.cursor()
         cursor.execute("SELECT product_id, name, price, stock FROM local_products WHERE status = 'Active'")
         products = cursor.fetchall()
+        cursor.close()
         conn.close()
 
         if not products:
@@ -311,10 +339,13 @@ async def handle_all_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     elif data == "my_orders":
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_db_connection()
+        if not conn:
+            return
         cursor = conn.cursor()
-        cursor.execute("SELECT order_id, product_name, amount, status, created_at FROM orders WHERE user_id = ? ORDER BY order_id DESC LIMIT 8", (user_id,))
+        cursor.execute("SELECT order_id, product_name, amount, status, created_at FROM orders WHERE user_id = %s ORDER BY order_id DESC LIMIT 8", (user_id,))
         orders = cursor.fetchall()
+        cursor.close()
         conn.close()
 
         if not orders:
@@ -358,10 +389,13 @@ async def handle_all_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
     # --- LOCAL PRODUCT PURCHASE ---
     elif data.startswith("buy_local_"):
         product_id = int(data.split("_")[2])
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_db_connection()
+        if not conn:
+            return
         cursor = conn.cursor()
-        cursor.execute("SELECT name, description, price, stock FROM local_products WHERE product_id = ? AND status = 'Active'", (product_id,))
+        cursor.execute("SELECT name, description, price, stock FROM local_products WHERE product_id = %s AND status = 'Active'", (product_id,))
         prod = cursor.fetchone()
+        cursor.close()
         conn.close()
 
         if not prod:
@@ -379,12 +413,15 @@ async def handle_all_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
 
     elif data.startswith("confirm_local_"):
         product_id = int(data.split("_")[2])
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_db_connection()
+        if not conn:
+            return
         cursor = conn.cursor()
-        cursor.execute("SELECT name, price, stock FROM local_products WHERE product_id = ? AND status = 'Active'", (product_id,))
+        cursor.execute("SELECT name, price, stock FROM local_products WHERE product_id = %s AND status = 'Active'", (product_id,))
         prod = cursor.fetchone()
 
         if not prod or prod[2] <= 0:
+            cursor.close()
             conn.close()
             await query.edit_message_text("❌ দুঃখিত, প্রোডাক্টটি স্টক আউট!", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 ফিরে যান", callback_data="browse_products")]]))
             return
@@ -392,6 +429,7 @@ async def handle_all_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
         name, price, stock = prod
         user_balance = get_user_balance(user_id)
         if user_balance < price:
+            cursor.close()
             conn.close()
             await query.edit_message_text(
                 f"❌ পর্যাপ্ত ব্যালেন্স নেই!\nপ্রয়োজন: ৳{price} | আপনার আছে: ৳{user_balance:.2f}",
@@ -400,19 +438,21 @@ async def handle_all_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
             )
             return
 
+        success = False
         try:
-            cursor.execute("BEGIN TRANSACTION")
-            cursor.execute("UPDATE users SET balance = balance - ? WHERE user_id = ?", (price, user_id))
-            cursor.execute("UPDATE local_products SET stock = stock - 1 WHERE product_id = ? AND stock > 0", (product_id,))
-            cursor.execute("INSERT INTO orders (user_id, product_type, product_id, product_name, amount, status, delivery_info) VALUES (?, 'local', ?, ?, ?, 'Completed', 'Delivered')",
-                           (user_id, product_id, name, price))
+            cursor.execute("UPDATE users SET balance = balance - %s WHERE user_id = %s", (price, user_id))
+            cursor.execute("UPDATE local_products SET stock = stock - 1 WHERE product_id = %s AND stock > 0", (product_id,))
+            cursor.execute("""
+                INSERT INTO orders (user_id, product_type, product_id, product_name, amount, status, delivery_info) 
+                VALUES (%s, 'local', %s, %s, %s, 'Completed', 'Delivered')
+            """, (user_id, str(product_id), name, price))
             conn.commit()
             success = True
         except Exception as e:
             conn.rollback()
             logger.error(f"Order error: {e}")
-            success = False
         finally:
+            cursor.close()
             conn.close()
 
         if success:
@@ -462,13 +502,17 @@ async def handle_all_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
 
         res = await api_client.place_order({"product_id": p_id, "quantity": 1})
         if res and not res.get("error"):
-            conn = sqlite3.connect(DB_PATH)
-            cursor = conn.cursor()
-            cursor.execute("UPDATE users SET balance = balance - ? WHERE user_id = ?", (price, user_id))
-            cursor.execute("INSERT INTO orders (user_id, product_type, product_id, product_name, amount, status, delivery_info) VALUES (?, 'external', ?, ?, ?, 'Completed', ?)",
-                           (user_id, str(p_id), name, price, str(res)))
-            conn.commit()
-            conn.close()
+            conn = get_db_connection()
+            if conn:
+                cursor = conn.cursor()
+                cursor.execute("UPDATE users SET balance = balance - %s WHERE user_id = %s", (price, user_id))
+                cursor.execute("""
+                    INSERT INTO orders (user_id, product_type, product_id, product_name, amount, status, delivery_info) 
+                    VALUES (%s, 'external', %s, %s, %s, 'Completed', %s)
+                """, (user_id, str(p_id), name, price, str(res)))
+                conn.commit()
+                cursor.close()
+                conn.close()
             await query.edit_message_text(f"✅ API অর্ডার সফল হয়েছে!\nপ্রোডাক্ট: {name}\nমূল্য: ৳{price:.2f}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 মূল মেনু", callback_data="main_menu")]]))
         else:
             err_msg = res.get("error", "API Rejected Order") if res else "API Connection Failed"
@@ -487,7 +531,9 @@ async def handle_all_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
             await query.edit_message_text("👑 এডমিন কন্ট্রোল প্যানেল:", reply_markup=admin_menu_keyboard())
 
         elif data == "adm_dashboard":
-            conn = sqlite3.connect(DB_PATH)
+            conn = get_db_connection()
+            if not conn:
+                return
             cursor = conn.cursor()
             cursor.execute("SELECT COUNT(*) FROM users")
             total_users = cursor.fetchone()[0]
@@ -501,13 +547,14 @@ async def handle_all_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
             ord_res = cursor.fetchone()
             completed_orders = ord_res[0]
             total_sales = ord_res[1] or 0.0
+            cursor.close()
             conn.close()
 
             ext_balance_data = await api_client.get_balance()
             ext_balance = ext_balance_data.get("balance", "N/A") if isinstance(ext_balance_data, dict) else "Unavailable"
 
             text = (
-                "📊 এডমিন ড্যাশবোর্ড\n\n"
+                "📊 এডমিন ড্যাশবোর্ড (Supabase)\n\n"
                 f"👥 মোট ইউজার: {total_users}\n"
                 f"📦 মোট লোকাল প্রোডাক্ট: {total_prods}\n"
                 f"📥 মোট লোকাল স্টক: {total_stock}\n"
@@ -527,10 +574,13 @@ async def handle_all_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
             )
 
         elif data == "adm_manage_tools":
-            conn = sqlite3.connect(DB_PATH)
+            conn = get_db_connection()
+            if not conn:
+                return
             cursor = conn.cursor()
             cursor.execute("SELECT product_id, name, price, stock, status FROM local_products")
             prods = cursor.fetchall()
+            cursor.close()
             conn.close()
 
             if not prods:
@@ -553,24 +603,28 @@ async def handle_all_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
 
         elif data.startswith("adm_toggle_"):
             p_id = int(data.split("_")[2])
-            conn = sqlite3.connect(DB_PATH)
-            cursor = conn.cursor()
-            cursor.execute("SELECT status FROM local_products WHERE product_id = ?", (p_id,))
-            row = cursor.fetchone()
-            if row:
-                new_status = 'Inactive' if row[0] == 'Active' else 'Active'
-                cursor.execute("UPDATE local_products SET status = ? WHERE product_id = ?", (new_status, p_id))
-                conn.commit()
-            conn.close()
+            conn = get_db_connection()
+            if conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT status FROM local_products WHERE product_id = %s", (p_id,))
+                row = cursor.fetchone()
+                if row:
+                    new_status = 'Inactive' if row[0] == 'Active' else 'Active'
+                    cursor.execute("UPDATE local_products SET status = %s WHERE product_id = %s", (new_status, p_id))
+                    conn.commit()
+                cursor.close()
+                conn.close()
             await query.edit_message_text(f"✅ প্রোডাক্ট ID {p_id} এর স্ট্যাটাস আপডেট হয়েছে!", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 ফিরে যান", callback_data="adm_manage_tools")]]))
 
         elif data.startswith("adm_del_"):
             p_id = int(data.split("_")[2])
-            conn = sqlite3.connect(DB_PATH)
-            cursor = conn.cursor()
-            cursor.execute("DELETE FROM local_products WHERE product_id = ?", (p_id,))
-            conn.commit()
-            conn.close()
+            conn = get_db_connection()
+            if conn:
+                cursor = conn.cursor()
+                cursor.execute("DELETE FROM local_products WHERE product_id = %s", (p_id,))
+                conn.commit()
+                cursor.close()
+                conn.close()
             await query.edit_message_text(f"🗑️ প্রোডাক্ট ID {p_id} ডিলিট করা হয়েছে!", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 ফিরে যান", callback_data="adm_manage_tools")]]))
 
         elif data == "adm_add_stock":
@@ -588,10 +642,13 @@ async def handle_all_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
             )
 
         elif data == "adm_manage_orders":
-            conn = sqlite3.connect(DB_PATH)
+            conn = get_db_connection()
+            if not conn:
+                return
             cursor = conn.cursor()
             cursor.execute("SELECT order_id, user_id, product_name, amount, status FROM orders ORDER BY order_id DESC LIMIT 8")
             orders = cursor.fetchall()
+            cursor.close()
             conn.close()
 
             text = "📋 সাম্প্রতিক অর্ডারসমূহ:\n(ইউজারকে মেসেজ পাঠাতে নিচের বাটনে ক্লিক করুন)\n\n"
@@ -619,10 +676,13 @@ async def handle_all_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
             )
 
         elif data == "adm_manage_payments":
-            conn = sqlite3.connect(DB_PATH)
+            conn = get_db_connection()
+            if not conn:
+                return
             cursor = conn.cursor()
             cursor.execute("SELECT payment_id, user_id, amount, trx_id, status FROM payments WHERE status = 'Pending' ORDER BY payment_id DESC LIMIT 10")
             payments = cursor.fetchall()
+            cursor.close()
             conn.close()
 
             text = "💳 পেন্ডিং পেমেন্ট রিকোয়েস্ট:\n\n"
@@ -642,39 +702,47 @@ async def handle_all_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
 
         elif data.startswith("adm_pay_app_"):
             p_id = int(data.split("_")[3])
-            conn = sqlite3.connect(DB_PATH)
-            cursor = conn.cursor()
-            cursor.execute("SELECT user_id, amount, status FROM payments WHERE payment_id = ?", (p_id,))
-            row = cursor.fetchone()
-            if row and row[2] == 'Pending':
-                u_id, amt, _ = row
-                cursor.execute("UPDATE payments SET status = 'Approved' WHERE payment_id = ?", (p_id,))
-                cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (amt, u_id))
-                conn.commit()
-                msg = f"✅ পেমেন্ট #{p_id} অ্যাপ্রুভ করা হয়েছে এবং ইউজার {u_id}-এর ব্যালেন্সে ৳{amt} যোগ হয়েছে!"
-                try:
-                    await context.bot.send_message(chat_id=u_id, text=f"🎉 আপনার ৳{amt} ডিপোজিট সফলভাবে অ্যাপ্রুভ করা হয়েছে!")
-                except Exception:
-                    pass
-            else:
-                msg = "❌ পেমেন্টটি ইতিমধ্যে প্রসেস করা হয়েছে।"
-            conn.close()
+            conn = get_db_connection()
+            msg = "Database error."
+            if conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT user_id, amount, status FROM payments WHERE payment_id = %s", (p_id,))
+                row = cursor.fetchone()
+                if row and row[2] == 'Pending':
+                    u_id, amt, _ = row
+                    cursor.execute("UPDATE payments SET status = 'Approved' WHERE payment_id = %s", (p_id,))
+                    cursor.execute("UPDATE users SET balance = balance + %s WHERE user_id = %s", (amt, u_id))
+                    conn.commit()
+                    msg = f"✅ পেমেন্ট #{p_id} অ্যাপ্রুভ করা হয়েছে এবং ইউজার {u_id}-এর ব্যালেন্সে ৳{amt} যোগ হয়েছে!"
+                    try:
+                        await context.bot.send_message(chat_id=u_id, text=f"🎉 আপনার ৳{amt} ডিপোজিট সফলভাবে অ্যাপ্রুভ করা হয়েছে!")
+                    except Exception:
+                        pass
+                else:
+                    msg = "❌ পেমেন্টটি ইতিমধ্যে প্রসেস করা হয়েছে।"
+                cursor.close()
+                conn.close()
             await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 ফিরে যান", callback_data="adm_manage_payments")]]))
 
         elif data.startswith("adm_pay_rej_"):
             p_id = int(data.split("_")[3])
-            conn = sqlite3.connect(DB_PATH)
-            cursor = conn.cursor()
-            cursor.execute("UPDATE payments SET status = 'Rejected' WHERE payment_id = ?", (p_id,))
-            conn.commit()
-            conn.close()
+            conn = get_db_connection()
+            if conn:
+                cursor = conn.cursor()
+                cursor.execute("UPDATE payments SET status = 'Rejected' WHERE payment_id = %s", (p_id,))
+                conn.commit()
+                cursor.close()
+                conn.close()
             await query.edit_message_text(f"❌ পেমেন্ট #{p_id} রিজেক্ট করা হয়েছে।", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 ফিরে যান", callback_data="adm_manage_payments")]]))
 
         elif data == "adm_users":
-            conn = sqlite3.connect(DB_PATH)
+            conn = get_db_connection()
+            if not conn:
+                return
             cursor = conn.cursor()
             cursor.execute("SELECT user_id, first_name, balance FROM users ORDER BY created_at DESC LIMIT 10")
             users = cursor.fetchall()
+            cursor.close()
             conn.close()
 
             text = "👥 রেজিস্টার্ড ইউজার লিস্ট:\n\n"
@@ -695,12 +763,15 @@ async def handle_all_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
             )
 
         elif data == "adm_stats":
-            conn = sqlite3.connect(DB_PATH)
+            conn = get_db_connection()
+            if not conn:
+                return
             cursor = conn.cursor()
             cursor.execute("SELECT COUNT(*), SUM(amount) FROM orders WHERE status = 'Completed'")
             ord_stats = cursor.fetchone()
             cursor.execute("SELECT COUNT(*), SUM(amount) FROM payments WHERE status = 'Approved'")
             pay_stats = cursor.fetchone()
+            cursor.close()
             conn.close()
 
             text = (
@@ -720,7 +791,7 @@ async def handle_all_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
                 f"👑 Admin User ID: {ADMIN_USER_ID}\n"
                 f"🌐 External API URL: {EXTERNAL_API_BASE_URL}\n"
                 f"🔑 External API Status: {ext_status}\n"
-                f"🗄️ Database: SQLite (Active)"
+                f"🗄️ Database: Supabase PostgreSQL (Active)"
             )
             keyboard = [[InlineKeyboardButton("🔙 এডমিন মেনু", callback_data="admin_panel")]]
             await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
@@ -759,12 +830,16 @@ async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYP
     elif state == 'WAIT_DEPOSIT_TRX':
         amount = context.user_data.get('deposit_amount', 0)
         trx_id = text
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute("INSERT INTO payments (user_id, amount, method, trx_id, status) VALUES (?, ?, 'bKash/Nagad', ?, 'Pending')",
-                       (user_id, amount, trx_id))
-        conn.commit()
-        conn.close()
+        conn = get_db_connection()
+        if conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO payments (user_id, amount, method, trx_id, status) 
+                VALUES (%s, %s, 'bKash/Nagad', %s, 'Pending')
+            """, (user_id, amount, trx_id))
+            conn.commit()
+            cursor.close()
+            conn.close()
         context.user_data['state'] = None
 
         await update.message.reply_text(
@@ -817,12 +892,16 @@ async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYP
                 desc = context.user_data['new_desc']
                 price = context.user_data['new_price']
 
-                conn = sqlite3.connect(DB_PATH)
-                cursor = conn.cursor()
-                cursor.execute("INSERT INTO local_products (name, description, price, stock, status) VALUES (?, ?, ?, ?, 'Active')",
-                               (name, desc, price, stock))
-                conn.commit()
-                conn.close()
+                conn = get_db_connection()
+                if conn:
+                    cursor = conn.cursor()
+                    cursor.execute("""
+                        INSERT INTO local_products (name, description, price, stock, status) 
+                        VALUES (%s, %s, %s, %s, 'Active')
+                    """, (name, desc, price, stock))
+                    conn.commit()
+                    cursor.close()
+                    conn.close()
                 context.user_data['state'] = None
 
                 await update.message.reply_text(
@@ -835,10 +914,13 @@ async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYP
         elif state == 'ADM_STOCK_ID':
             try:
                 p_id = int(text)
-                conn = sqlite3.connect(DB_PATH)
+                conn = get_db_connection()
+                if not conn:
+                    return
                 cursor = conn.cursor()
-                cursor.execute("SELECT name, stock FROM local_products WHERE product_id = ?", (p_id,))
+                cursor.execute("SELECT name, stock FROM local_products WHERE product_id = %s", (p_id,))
                 prod = cursor.fetchone()
+                cursor.close()
                 conn.close()
                 if not prod:
                     await update.message.reply_text("❌ এই ID-তে কোনো প্রোডাক্ট নেই। সঠিক ID দিন:")
@@ -853,11 +935,13 @@ async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYP
             try:
                 qty = int(text)
                 p_id = context.user_data['edit_prod_id']
-                conn = sqlite3.connect(DB_PATH)
-                cursor = conn.cursor()
-                cursor.execute("UPDATE local_products SET stock = stock + ? WHERE product_id = ?", (qty, p_id))
-                conn.commit()
-                conn.close()
+                conn = get_db_connection()
+                if conn:
+                    cursor = conn.cursor()
+                    cursor.execute("UPDATE local_products SET stock = stock + %s WHERE product_id = %s", (qty, p_id))
+                    conn.commit()
+                    cursor.close()
+                    conn.close()
                 context.user_data['state'] = None
                 await update.message.reply_text(
                     f"✅ প্রোডাক্ট #{p_id}-এ {qty} টি স্টক যোগ করা হয়েছে!",
@@ -879,11 +963,13 @@ async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYP
             try:
                 new_price = float(text)
                 p_id = context.user_data['edit_prod_id']
-                conn = sqlite3.connect(DB_PATH)
-                cursor = conn.cursor()
-                cursor.execute("UPDATE local_products SET price = ? WHERE product_id = ?", (new_price, p_id))
-                conn.commit()
-                conn.close()
+                conn = get_db_connection()
+                if conn:
+                    cursor = conn.cursor()
+                    cursor.execute("UPDATE local_products SET price = %s WHERE product_id = %s", (new_price, p_id))
+                    conn.commit()
+                    cursor.close()
+                    conn.close()
                 context.user_data['state'] = None
                 await update.message.reply_text(
                     f"✅ প্রোডাক্ট #{p_id}-এর নতুন দাম ৳{new_price} সেট করা হয়েছে!",
@@ -905,15 +991,17 @@ async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYP
             try:
                 amt = float(text)
                 target_id = context.user_data['target_user_id']
-                conn = sqlite3.connect(DB_PATH)
-                cursor = conn.cursor()
-                cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (amt, target_id))
-                conn.commit()
-                conn.close()
+                conn = get_db_connection()
+                if conn:
+                    cursor = conn.cursor()
+                    cursor.execute("UPDATE users SET balance = balance + %s WHERE user_id = %s", (amt, target_id))
+                    conn.commit()
+                    cursor.close()
+                    conn.close()
                 context.user_data['state'] = None
                 await update.message.reply_text(
                     f"✅ ইউজার {target_id}-এর ব্যালেন্স আপডেট করা হয়েছে!",
-                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("👑 এডমিন প্যানেल", callback_data="admin_panel")]])
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("👑 এডমিন প্যানেল", callback_data="admin_panel")]])
                 )
             except ValueError:
                 await update.message.reply_text("❌ সঠিক অ্যামাউন্ট সংখ্যায় লিখুন:")
@@ -929,7 +1017,6 @@ def main():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_messages))
 
     logger.info("Bot is starting and polling for updates...")
-    # FIXED: changed 'allowed_types' to 'allowed_updates' for compatibility with python-telegram-bot v21+
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
