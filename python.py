@@ -168,123 +168,13 @@ bot = Bot(token=settings.TELEGRAM_BOT_TOKEN)
 dp = Dispatcher()
 router = Router()
 
-# Inline HTML Templates for Admin Panel
-admin_templates_html = """
-{% macro layout(title, content) %}
-<!DOCTYPE html>
-<html lang="bn">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{{ title }} - Admin Panel</title>
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/css/bootstrap.min.css" rel="stylesheet">
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.5/font/bootstrap-icons.css">
-</head>
-<body class="bg-light">
-    <nav class="navbar navbar-dark bg-dark shadow-sm">
-        <div class="container-fluid">
-            <a class="navbar-brand" href="/admin/dashboard"><i class="bi bi-shield-lock-fill"></i> Admin Dashboard</a>
-            <span class="text-white">Super Admin (6551628383)</span>
-        </div>
-    </nav>
-    <div class="container-fluid">
-        <div class="row">
-            <nav id="sidebar" class="col-md-3 col-lg-2 d-md-block bg-white sidebar collapse shadow-sm vh-100 p-3">
-                <ul class="nav flex-column">
-                    <li class="nav-item mb-2"><a class="nav-link text-dark" href="/admin/dashboard"><i class="bi bi-speedometer2"></i> ড্যাশবোর্ড</a></li>
-                    <li class="nav-item mb-2"><a class="nav-link text-dark" href="/admin/products"><i class="bi bi-box-seam"></i> প্রোডাক্ট ম্যানেজমেন্ট</a></li>
-                    <li class="nav-item mb-2"><a class="nav-link text-dark" href="/admin/orders"><i class="bi bi-cart-check"></i> অর্ডারসমূহ</a></li>
-                    <li class="nav-item mb-2"><a class="nav-link text-dark" href="/admin/payments"><i class="bi bi-wallet2"></i> পেমেন্টস</a></li>
-                    <li class="nav-item mb-2"><a class="nav-link text-dark" href="/admin/users"><i class="bi bi-people"></i> কাস্টমার্স</a></li>
-                    <li class="nav-item mb-2"><a class="nav-link text-dark" href="/admin/logs"><i class="bi bi-journal-text"></i> অডিট লগ</a></li>
-                </ul>
-            </nav>
-            <main class="col-md-9 ms-sm-auto col-lg-10 px-md-4 py-4">
-                {{ content | safe }}
-            </main>
-        </div>
-    </div>
-    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
-</body>
-</html>
-{% endmacro %}
-
-{% block dashboard %}
-{% import context as self %}
-{% call layout("Dashboard", '''
-    <h2 class="mb-4">সিস্টেম ড্যাশবোর্ড</h2>
-    <div class="row g-4">
-        <div class="col-md-4">
-            <div class="card text-bg-primary shadow-sm">
-                <div class="card-body">
-                    <h5 class="card-title">মোট ব্যবহারকারী</h5>
-                    <h3>{{ user_count }}</h3>
-                </div>
-            </div>
-        </div>
-        <div class="col-md-4">
-            <div class="card text-bg-success shadow-sm">
-                <div class="card-body">
-                    <h5 class="card-title">মোট অর্ডার</h5>
-                    <h3>{{ order_count }}</h3>
-                </div>
-            </div>
-        </div>
-        <div class="col-md-4">
-            <div class="card text-bg-warning shadow-sm">
-                <div class="card-body">
-                    <h5 class="card-title">সাপ্লায়ার ব্যালেন্স</h5>
-                    <h3>${{ supplier_balance }}</h3>
-                </div>
-            </div>
-        </div>
-    </div>
-    <div class="mt-5">
-        <a href="/admin/sync-products" class="btn btn-dark"><i class="bi bi-arrow-repeat"></i> সাপ্লায়ার থেকে প্রোডাক্ট সিঙ্ক করুন</a>
-    </div>
-''') %}
-{% endblock %}
-
-{% block products %}
-{% call layout("Products", '''
-    <h2 class="mb-4">প্রোডাক্ট তালিকা</h2>
-    <table class="table table-striped table-hover bg-white shadow-sm rounded">
-        <thead>
-            <tr>
-                <th>ID</th>
-                <th>নাম</th>
-                <th>মূল্য</th>
-                <th>স্টক</th>
-                <th>অ্যাক্টিভ</th>
-            </tr>
-        </thead>
-        <tbody>
-            {% for p in products %}
-            <tr>
-                <td>{{ p.id }}</td>
-                <td>{{ p.name }}</td>
-                <td>৳{{ p.price }}</td>
-                <td>{{ p.stock }}</td>
-                <td>{{ "হ্যাঁ" if p.is_active else "না" }}</td>
-            </tr>
-            {% endfor %}
-        </tbody>
-    </table>
-''') %}
-{% endblock %}
-"""
-
 templates = Jinja2Templates(directory=".")
-# For inline templates simulation, we can write a tiny wrapper or file write on startup if needed, 
-# or render direct HTML strings. Let's create an in-memory template environment or write templates to disk at startup.
 
 @app.on_event("startup")
 async def startup_event():
-    # Create tables
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     
-    # Write inline html templates to disk for Jinja2
     os.makedirs("templates", exist_ok=True)
     with open("templates/dashboard.html", "w", encoding="utf-8") as f:
         f.write("""
@@ -299,7 +189,7 @@ async def startup_event():
 <body class="bg-light">
     <nav class="navbar navbar-dark bg-dark px-4">
         <a class="navbar-brand" href="#"><i class="bi bi-shield-lock-fill"></i> প্রিমিয়াম টুলস অ্যাডমিন প্যানেল</a>
-        <span class="text-white">సూపర్ అডমিন: 6551628383</span>
+        <span class="text-white">সুপার এডমিন: 6551628383</span>
     </nav>
     <div class="container my-4">
         <h2>সিস্টেম ড্যাশবোর্ড</h2>
@@ -373,22 +263,23 @@ async def startup_event():
 </html>
         """)
 
-    # Set Telegram Webhook
-    webhook_url = f"{settings.APP_BASE_URL}/webhook/{settings.WEBHOOK_SECRET}"
-    await bot.set_webhook(webhook_url, drop_pending_updates=True)
+    try:
+        webhook_url = f"{settings.APP_BASE_URL}/webhook/{settings.WEBHOOK_SECRET}"
+        await bot.set_webhook(webhook_url, drop_pending_updates=True)
+    except Exception as e:
+        logger.error(f"Webhook setup error: {e}")
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    await bot.delete_webhook()
-    await bot.session.close()
+    try:
+        await bot.delete_webhook()
+        await bot.session.close()
+    except Exception:
+        pass
 
 # FastAPI Admin Routes
 @app.get("/admin/dashboard", response_class=HTMLResponse)
-async def admin_dashboard(request: Request, admin_id: Optional[int] = None):
-    # Security check for super admin
-    if admin_id != settings.TELEGRAM_ADMIN_ID:
-        # For demonstration or simple query param auth
-        pass
+async def admin_dashboard(request: Request):
     async with AsyncSessionLocal() as session:
         users_res = await session.execute(select(User))
         user_count = len(users_res.scalars().all())
@@ -418,7 +309,6 @@ async def admin_sync():
     data = await supplier_client.get_products()
     async with AsyncSessionLocal() as session:
         for item in data:
-            # Upsert product logic
             res = await session.execute(select(Product).where(Product.supplier_product_id == str(item.get("id"))))
             prod = res.scalars().first()
             if not prod:
@@ -480,7 +370,6 @@ async def cmd_start(message: Message):
             await session.commit()
             await session.refresh(user)
 
-            # Create wallet
             wallet = Wallet(user_id=user.id, balance=0.0)
             session.add(wallet)
             await session.commit()
@@ -671,16 +560,13 @@ async def cb_process_purchase(callback: CallbackQuery):
             await callback.answer("আপনার ওয়ালেটে পর্যাপ্ত ব্যালেন্স নেই! দয়া করে টাকা যোগ করুন।", show_alert=True)
             return
 
-        # Deduct wallet
         wallet.balance -= product.price
         
-        # Create order
         order = Order(user_id=user.id, product_id=product.id, price=product.price, status="PENDING")
         session.add(order)
         await session.commit()
         await session.refresh(order)
 
-        # Submit to supplier API if supplier_product_id exists
         supplier_res = None
         if product.supplier_product_id:
             supplier_res = await supplier_client.create_order(product.supplier_product_id)
@@ -690,7 +576,7 @@ async def cb_process_purchase(callback: CallbackQuery):
             else:
                 order.status = "FAILED"
         else:
-            order.status = "SUCCESS" # Manual or direct fulfillment
+            order.status = "SUCCESS"
 
         await session.commit()
 
@@ -702,4 +588,4 @@ dp.include_router(router)
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
-    uvicorn.import_string("python:app")
+    uvicorn.run("python:app", host="0.0.0.0", port=port)
