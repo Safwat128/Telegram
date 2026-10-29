@@ -1,6 +1,6 @@
 """
 Production-Ready Telegram Bot with Supabase PostgreSQL Database,
-Fixed Database Queries, User Balances, and Product Management.
+BDGate Live Payment Gateway Integration, USDT to BDT Pricing, and Admin Controls.
 """
 
 import sys
@@ -40,6 +40,10 @@ ADMIN_USER_ID = 6551628383
 EXTERNAL_API_BASE_URL = "https://safwantigershopbot-production.up.railway.app/api"
 EXTERNAL_API_KEY = "stapi_ada749893e7a50de084870a8aaed5508390a5b067c0767ec270e740a8fd52c19"
 
+# BDGate Payment Gateway Configuration
+BDGATE_BASE_URL = "https://api.bdgate.net/api/v1"
+BDGATE_API_KEY = "bd_live_06981e9a4c31b664c75fd4990c68f4010f2b8198"
+
 USDT_TO_BDT = 135.0  # 1 USDT = 135 BDT Conversion Rate
 
 if not BOT_TOKEN:
@@ -67,7 +71,6 @@ def init_db():
     
     cursor = conn.cursor()
     
-    # Independent tables with strict Primary Keys
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id BIGINT PRIMARY KEY,
@@ -135,7 +138,7 @@ def init_db():
 init_db()
 
 # ---------------------------------------------------------------------------
-# EXTERNAL API CLIENT
+# EXTERNAL API & BDGATE PAYMENT CLIENT
 # ---------------------------------------------------------------------------
 class ExternalAPIClient:
     def __init__(self):
@@ -184,6 +187,35 @@ class ExternalAPIClient:
         except Exception as e:
             logger.error(f"External API error for /order: {e}")
             return {"error": str(e)}
+
+async def create_bdgate_checkout(amount: float, order_id: str, user_name: str) -> Optional[Dict[str, Any]]:
+    url = f"{BDGATE_BASE_URL}/checkout"
+    headers = {
+        "Content-Type": "application/json",
+        "X-API-Key": BDGATE_API_KEY
+    }
+    payload = {
+        "amount": f"{amount:.2f}",
+        "customer_name": user_name or "Telegram User",
+        "customer_email": "user@telegram.bot",
+        "customer_phone": "01700000000",
+        "order_id": order_id,
+        "success_url": "https://t.me/",
+        "fail_url": "https://t.me/",
+        "cancel_url": "https://t.me/",
+        "webhook_url": "https://safwantigershopbot-production.up.railway.app/api/webhook",
+        "description": f"Balance Top-up {order_id}"
+    }
+    
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        try:
+            response = await client.post(url, json=payload, headers=headers)
+            if response.status_code in [200, 201]:
+                return response.json()
+            logger.error(f"BDGate Checkout Error: {response.status_code} - {response.text}")
+        except Exception as e:
+            logger.error(f"BDGate connection error: {e}")
+    return None
 
 api_client = ExternalAPIClient()
 
@@ -361,8 +393,8 @@ async def handle_all_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
     elif data == "add_balance":
         context.user_data['state'] = 'WAIT_DEPOSIT_AMOUNT'
         text = (
-            "➕ ব্যালেন্স যোগ করুন (bKash / Nagad)\n\n"
-            "আপনি কত টাকা অ্যাড করতে চান তা ইংরেজিতে সংখ্যায় লিখুন (যেমন: 500):"
+            "➕ ব্যালেন্স যোগ করুন (Online Payment)\n\n"
+            "আপনি কত টাকা ডিপোজিট করতে চান তা ইংরেজিতে সংখ্যায় লিখুন (যেমন: 500):"
         )
         keyboard = [[InlineKeyboardButton("🔙 বাতিল করুন", callback_data="main_menu")]]
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
@@ -796,7 +828,7 @@ async def handle_all_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
             await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 # ---------------------------------------------------------------------------
-# UNIFIED TEXT INPUT HANDLER
+# UNIFIED TEXT INPUT HANDLER (Includes BDGate Payment Generation)
 # ---------------------------------------------------------------------------
 async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
@@ -804,47 +836,67 @@ async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYP
 
     text = update.message.text.strip()
     user_id = update.effective_user.id
+    user_name = update.effective_user.first_name
     state = context.user_data.get('state')
 
     if not state:
         return
 
-    # --- USER DEPOSIT FLOW ---
+    # --- USER DEPOSIT FLOW (BDGate Live Integration) ---
     if state == 'WAIT_DEPOSIT_AMOUNT':
         try:
             amount = float(text)
             if amount < 10 or amount > 50000:
-                await update.message.reply_text("দয়া করে ১০ থেকে ৫০,০০০ টাকার মধ্যে সংখ্যা লিখুন:")
+                await update.message.reply_text("দয়া করে ১০ থেকে ৫০,০০০ টাকার মধ্যে অ্যামাউন্ট লিখুন:")
                 return
-            context.user_data['deposit_amount'] = amount
-            context.user_data['state'] = 'WAIT_DEPOSIT_TRX'
-            await update.message.reply_text(
-                f"💳 অ্যামাউন্ট: ৳{amount}\n\n"
-                "অনুগ্রহ করে bKash/Nagad পেমেন্ট সম্পন্ন করে আপনার Transaction ID (TrxID) চ্যাট বক্সে লিখে পাঠান:",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 বাতিল", callback_data="main_menu")]])
-            )
+            
+            # Generate unique order/invoice id for payment
+            order_id = f"TOPUP-{user_id}-{int(asyncio.get_event_loop().time())}" if 'asyncio' in globals() else f"TOPUP-{user_id}"
+            
+            # Call BDGate Checkout API
+            wait_msg = await update.message.reply_text("⏳ পেমেন্ট গেটওয়ে লিংক তৈরি হচ্ছে, অনুগ্রহ করে অপেক্ষা করুন...")
+            
+            res = await create_bdgate_checkout(amount, order_id, user_name)
+            
+            # Delete waiting message
+            try:
+                await wait_msg.delete()
+            except Exception:
+                pass
+
+            if res and ("payment_url" in res or "url" in res or "gateway_url" in res):
+                pay_url = res.get("payment_url") or res.get("url") or res.get("gateway_url")
+                
+                # Save pending transaction in database
+                conn = get_db_connection()
+                if conn:
+                    cursor = conn.cursor()
+                    cursor.execute("""
+                        INSERT INTO payments (user_id, amount, method, trx_id, status) 
+                        VALUES (%s, %s, 'BDGate', %s, 'Pending')
+                    """, (user_id, amount, order_id))
+                    conn.commit()
+                    cursor.close()
+                    conn.close()
+
+                context.user_data['state'] = None
+                
+                keyboard = [[InlineKeyboardButton("💳 পেমেন্ট সম্পূর্ণ করুন", url=pay_url)],
+                            [InlineKeyboardButton("🔙 মূল মেনু", callback_data="main_menu")]]
+                
+                await update.message.reply_text(
+                    f"✅ পেমেন্ট ইনভয়েস তৈরি হয়েছে!\n\nঅ্যামাউন্ট: ৳{amount:.2f}\nঅর্ডার আইডি: `{order_id}`\n\nনিচের লিংকে ক্লিক করে আপনার পেমেন্ট সম্পন্ন করুন:",
+                    reply_markup=InlineKeyboardMarkup(keyboard),
+                    parse_mode="Markdown"
+                )
+            else:
+                err_desc = res.get("error", "Gateway response error") if res else "API timeout or failure"
+                await update.message.reply_text(
+                    f"❌ পেমেন্ট লিংক তৈরি করতে ব্যর্থ হয়েছে।\nকারণ: {err_desc}",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 মূল মেনু", callback_data="main_menu")]]))
+            
         except ValueError:
             await update.message.reply_text("❌ সঠিক সংখ্যা লিখুন (যেমন: 500):")
-
-    elif state == 'WAIT_DEPOSIT_TRX':
-        amount = context.user_data.get('deposit_amount', 0)
-        trx_id = text
-        conn = get_db_connection()
-        if conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                INSERT INTO payments (user_id, amount, method, trx_id, status) 
-                VALUES (%s, %s, 'bKash/Nagad', %s, 'Pending')
-            """, (user_id, amount, trx_id))
-            conn.commit()
-            cursor.close()
-            conn.close()
-        context.user_data['state'] = None
-
-        await update.message.reply_text(
-            f"✅ আপনার পেমেন্ট রিকোয়েস্ট জমা হয়েছে!\nঅ্যামাউন্ট: ৳{amount}\nTrxID: {trx_id}\n\nএডমিন ভেরিফাই করার পর আপনার ব্যালেন্স যোগ হয়ে যাবে।",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 মূল মেনু", callback_data="main_menu")]])
-        )
 
     # --- ADMIN FLOWS ---
     elif user_id == ADMIN_USER_ID:
