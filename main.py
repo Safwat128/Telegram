@@ -1,6 +1,6 @@
 """
 Production-Ready Telegram Bot with Supabase PostgreSQL Database,
-BDGate Live Payment Gateway & Direct Verification API, USDT to BDT Pricing, and Admin Controls.
+BDGate Live Payment Gateway (Fixed Payload Fields), USDT to BDT Pricing, and Admin Controls.
 """
 
 import sys
@@ -41,7 +41,7 @@ ADMIN_USER_ID = 6551628383
 EXTERNAL_API_BASE_URL = "https://safwantigershopbot-production.up.railway.app/api"
 EXTERNAL_API_KEY = "stapi_ada749893e7a50de084870a8aaed5508390a5b067c0767ec270e740a8fd52c19"
 
-# BDGate Payment Gateway Configuration (Updated Live API Key)
+# BDGate Payment Gateway Configuration (Live API Key)
 BDGATE_BASE_URL = "https://api.bdgate.net/api/v1"
 BDGATE_API_KEY = "bd_live_eacc422a559bdec435f251ed9c8d2159"
 
@@ -149,7 +149,7 @@ class ExternalAPIClient:
             "x-api-key": EXTERNAL_API_KEY if EXTERNAL_API_KEY else "",
             "Content-Type": "application/json"
         }
-        self.timeout = 12.0
+        self.timeout = 15.0
 
     async def get_products(self) -> Optional[List[Dict[str, Any]]]:
         url = f"{self.base_url}/products"
@@ -189,18 +189,21 @@ class ExternalAPIClient:
             logger.error(f"External API error for /order: {e}")
             return {"error": str(e)}
 
-async def create_bdgate_checkout(amount: float, order_id: str, user_name: str) -> Optional[Dict[str, Any]]:
+async def create_bdgate_checkout(amount: float, order_id: str, user_name: str) -> Dict[str, Any]:
     url = f"{BDGATE_BASE_URL}/checkout"
     headers = {
         "Content-Type": "application/json",
         "X-API-Key": BDGATE_API_KEY
     }
+    
+    # BDGate Direct Payment System Required Fields Added
     payload = {
         "amount": f"{amount:.2f}",
         "customer_name": user_name or "Telegram User",
         "customer_email": "user@telegram.bot",
         "customer_phone": "01700000000",
         "order_id": order_id,
+        "callback_url": "https://telegram-zmiu.onrender.com/webhook",
         "success_url": "https://telegram-zmiu.onrender.com",
         "fail_url": "https://telegram-zmiu.onrender.com",
         "cancel_url": "https://telegram-zmiu.onrender.com",
@@ -208,17 +211,20 @@ async def create_bdgate_checkout(amount: float, order_id: str, user_name: str) -
         "description": f"Balance Top-up {order_id}"
     }
     
-    async with httpx.AsyncClient(timeout=15.0) as client:
+    async with httpx.AsyncClient(timeout=40.0) as client:
         try:
             response = await client.post(url, json=payload, headers=headers)
-            logger.info(f"BDGate API Response Status: {response.status_code}")
-            logger.info(f"BDGate API Response Body: {response.text}")
+            logger.info(f"BDGate API Status: {response.status_code}")
+            logger.info(f"BDGate API Body: {response.text}")
             
             if response.status_code in [200, 201]:
-                return response.json()
+                return {"success": True, "data": response.json()}
+            else:
+                return {"success": False, "error": f"Status {response.status_code}: {response.text}"}
+        except httpx.TimeoutException:
+            return {"success": False, "error": "Connection timed out. Server took too long to respond."}
         except Exception as e:
-            logger.error(f"BDGate connection error: {e}")
-    return None
+            return {"success": False, "error": str(e)}
 
 async def verify_bdgate_payment(payment_id_or_trx: str) -> Optional[Dict[str, Any]]:
     url = f"{BDGATE_BASE_URL}/payment/verify"
@@ -230,7 +236,7 @@ async def verify_bdgate_payment(payment_id_or_trx: str) -> Optional[Dict[str, An
         "payment_id": payment_id_or_trx
     }
     
-    async with httpx.AsyncClient(timeout=15.0) as client:
+    async with httpx.AsyncClient(timeout=30.0) as client:
         try:
             response = await client.post(url, json=payload, headers=headers)
             if response.status_code == 200:
@@ -775,7 +781,6 @@ async def handle_all_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
             cursor.close()
             conn.close()
 
-            # Call BDGate Verify API
             await query.edit_message_text("⏳ BDGate API থেকে পেমেন্ট স্ট্যাটাস যাচাই করা হচ্ছে...")
             
             verify_res = await verify_bdgate_payment(trx_id)
@@ -787,7 +792,6 @@ async def handle_all_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
                     is_success = True
 
             if verify_res and "error" not in verify_res and not is_success:
-                # Fallback check if gateway returns verified object directly
                 is_success = True  
 
             if is_success:
@@ -915,42 +919,56 @@ async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYP
             
             wait_msg = await update.message.reply_text("⏳ পেমেন্ট গেটওয়ে লিংক তৈরি হচ্ছে, অনুগ্রহ করে অপেক্ষা করুন...")
             
-            res = await create_bdgate_checkout(amount, order_id, user_name)
+            result = await create_bdgate_checkout(amount, order_id, user_name)
             
             try:
                 await wait_msg.delete()
             except Exception:
                 pass
 
-            if res and ("payment_url" in res or "url" in res or "gateway_url" in res):
-                pay_url = res.get("payment_url") or res.get("url") or res.get("gateway_url")
+            if result.get("success"):
+                res = result.get("data", {})
+                pay_url = res.get("payment_url") or res.get("url") or res.get("gateway_url") or res.get("checkout_url")
                 
-                conn = get_db_connection()
-                if conn:
-                    cursor = conn.cursor()
-                    cursor.execute("""
-                        INSERT INTO payments (user_id, amount, method, trx_id, status) 
-                        VALUES (%s, %s, 'BDGate', %s, 'Pending')
-                    """, (user_id, amount, order_id))
-                    conn.commit()
-                    cursor.close()
-                    conn.close()
+                if not pay_url and isinstance(res, dict):
+                    for k, v in res.items():
+                        if isinstance(v, str) and v.startswith("http"):
+                            pay_url = v
+                            break
 
-                context.user_data['state'] = None
-                
-                keyboard = [[InlineKeyboardButton("💳 পেমেন্ট সম্পূর্ণ করুন", url=pay_url)],
-                            [InlineKeyboardButton("🔙 মূল মেনু", callback_data="main_menu")]]
-                
-                await update.message.reply_text(
-                    f"✅ পেমেন্ট ইনভয়েস তৈরি হয়েছে!\n\nঅ্যামাউন্ট: ৳{amount:.2f}\nঅর্ডার আইডি: `{order_id}`\n\nনিচের লিংকে ক্লিক করে আপনার পেমেন্ট সম্পন্ন করুন:",
-                    reply_markup=InlineKeyboardMarkup(keyboard),
-                    parse_mode="Markdown"
-                )
+                if pay_url:
+                    conn = get_db_connection()
+                    if conn:
+                        cursor = conn.cursor()
+                        cursor.execute("""
+                            INSERT INTO payments (user_id, amount, method, trx_id, status) 
+                            VALUES (%s, %s, 'BDGate', %s, 'Pending')
+                        """, (user_id, amount, order_id))
+                        conn.commit()
+                        cursor.close()
+                        conn.close()
+
+                    context.user_data['state'] = None
+                    
+                    keyboard = [[InlineKeyboardButton("💳 পেমেন্ট সম্পূর্ণ করুন", url=pay_url)],
+                                [InlineKeyboardButton("🔙 মূল মেনু", callback_data="main_menu")]]
+                    
+                    await update.message.reply_text(
+                        f"✅ পেমেন্ট ইনভয়েস তৈরি হয়েছে!\n\nঅ্যামাউন্ট: ৳{amount:.2f}\nঅর্ডার আইডি: `{order_id}`\n\nনিচের লিংকে ক্লিক করে আপনার পেমেন্ট সম্পন্ন করুন:",
+                        reply_markup=InlineKeyboardMarkup(keyboard),
+                        parse_mode="Markdown"
+                    )
+                else:
+                    await update.message.reply_text(
+                        f"❌ পেমেন্ট গেটওয়ে থেকে কোনো লিংক পাওয়া যায়নি।\nAPI Response: {res}",
+                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 মূল মেনু", callback_data="main_menu")]])
+                    )
             else:
-                err_desc = res.get("error", "Gateway response error") if res else "API timeout or failure"
+                err_desc = result.get("error", "Unknown error")
                 await update.message.reply_text(
-                    f"❌ পেমেন্ট লিংক তৈরি করতে ব্যর্থ হয়েছে।\nকারণ: {err_desc}",
-                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 মূল মেনু", callback_data="main_menu")]]))
+                    f"❌ পেমেন্ট লিংক তৈরি ব্যর্থ হয়েছে।\nকারণ: {err_desc}",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 মূল মেনু", callback_data="main_menu")]])
+                )
             
         except ValueError:
             await update.message.reply_text("❌ সঠিক সংখ্যা লিখুন (যেমন: 500):")
