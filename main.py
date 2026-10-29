@@ -1,6 +1,6 @@
 """
 Production-Ready Telegram Bot for Digital Product Delivery & Secure Payments.
-Fully Fixed State Machine (No Stuck Buttons) + Complete Admin & User Features.
+Includes User Messaging from Admin Panel and USDT to BDT Converted Pricing.
 """
 
 import sys
@@ -39,6 +39,8 @@ BOT_TOKEN = "8307223176:AAFj-2H86Ma6JmF_Zv1oYIPy0V3O15N-v5c"
 ADMIN_USER_ID = 6551628383
 EXTERNAL_API_BASE_URL = "https://safwantigershopbot-production.up.railway.app/api"
 EXTERNAL_API_KEY = "stapi_ada749893e7a50de084870a8aaed5508390a5b067c0767ec270e740a8fd52c19"
+
+USDT_TO_BDT = 135.0  # 1 USDT = 135 BDT Conversion Rate
 
 if not BOT_TOKEN:
     logger.error("CRITICAL: BOT_TOKEN is missing!")
@@ -227,14 +229,14 @@ def admin_menu_keyboard() -> InlineKeyboardMarkup:
 # START & UNIFIED CALLBACK HANDLER
 # ---------------------------------------------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()  # Reset any stuck state
+    context.user_data.clear()
     user = update.effective_user
     register_user_if_not_exists(user.id, user.username or "", user.first_name or "")
     is_admin = (user.id == ADMIN_USER_ID)
     
     welcome_text = (
         f"স্বাগতম, {user.first_name}!\n\n"
-        "প্রিমিয়াম ডিজিটাল টুলস এবং সার্ভিসেস কিনতে নিচের মেনু থেকে আপনার প্রয়োজনীয় অপশনটি বেছে নিন:"
+        "প্রিমিয়াম ডিজিটাল টুলস এবং সার্ভিসেস কিনতে নিচের মেনু থেকে আপনার প্রয়োজনীয় অপشنটি বেছে নিন:"
     )
     
     if update.message:
@@ -251,10 +253,8 @@ async def handle_all_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
     user_id = update.effective_user.id
     is_admin = (user_id == ADMIN_USER_ID)
 
-    # Clear active input state whenever a navigation button is pressed
     context.user_data['state'] = None
 
-    # --- MAIN MENU NAVIGATION ---
     if data == "main_menu":
         await query.edit_message_text("🏠 মূল মেনুতে স্বাগতম:", reply_markup=main_menu_keyboard(is_admin))
         return
@@ -294,11 +294,12 @@ async def handle_all_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
         keyboard = []
         for idx, prod in enumerate(products[:20]):
             name = prod.get("name") or prod.get("title") or f"Tool #{idx+1}"
-            price = prod.get("price") or prod.get("rate") or "N/A"
-            keyboard.append([InlineKeyboardButton(f"{name} - ৳{price}", callback_data=f"buy_ext_{idx}")])
+            raw_price = float(prod.get("price") or prod.get("rate") or 0)
+            bdt_price = raw_price * USDT_TO_BDT  # USDT to BDT Conversion (1 USDT = 135 BDT)
+            keyboard.append([InlineKeyboardButton(f"{name} - ৳{bdt_price:.2f}", callback_data=f"buy_ext_{idx}")])
         keyboard.append([InlineKeyboardButton("🔙 ফিরে যান", callback_data="main_menu")])
 
-        await query.edit_message_text("💎 প্রিমিয়াম টুলস (External API):\nপছন্দের সার্ভিসটি সিলেক্ট করুন:", reply_markup=InlineKeyboardMarkup(keyboard))
+        await query.edit_message_text("💎 প্রিমিয়াম টুলস (External API):\n(রেট: ১ USDT = ১৩৫ টাকা)\nপছন্দের সার্ভিসটি সিলেক্ট করুন:", reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
     elif data == "my_balance":
@@ -354,7 +355,7 @@ async def handle_all_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
-    # --- LOCAL & EXTERNAL PRODUCT PURCHASE ---
+    # --- LOCAL PRODUCT PURCHASE ---
     elif data.startswith("buy_local_"):
         product_id = int(data.split("_")[2])
         conn = sqlite3.connect(DB_PATH)
@@ -420,6 +421,7 @@ async def handle_all_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
             await query.edit_message_text("❌ অর্ডার সম্পন্ন করা যায়নি।", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 মূল মেনু", callback_data="main_menu")]]))
         return
 
+    # --- EXTERNAL PRODUCT PURCHASE (USDT to BDT) ---
     elif data.startswith("buy_ext_"):
         idx = int(data.split("_")[2])
         products = context.user_data.get('ext_products', [])
@@ -429,10 +431,10 @@ async def handle_all_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
 
         prod = products[idx]
         name = prod.get("name") or prod.get("title") or f"Tool #{idx+1}"
-        price = float(prod.get("price") or prod.get("rate") or 0)
-        p_id = prod.get("id") or prod.get("product_id") or idx
+        raw_price = float(prod.get("price") or prod.get("rate") or 0)
+        price = raw_price * USDT_TO_BDT
 
-        text = f"💎 API প্রোডাক্ট: {name}\n💵 মূল্য: ৳{price}\n\nআপনি কি অর্ডার কনফার্ম করতে চান?"
+        text = f"💎 API প্রোডাক্ট: {name}\n💵 মূল্য: ৳{price:.2f} ({raw_price} USDT)\n\nআপনি কি অর্ডার কনফার্ম করতে চান?"
         keyboard = [
             [InlineKeyboardButton("✅ কনফার্ম অর্ডার", callback_data=f"confirm_ext_{idx}")],
             [InlineKeyboardButton("🔙 ফিরে যান", callback_data="premium_tools")]
@@ -449,12 +451,13 @@ async def handle_all_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
 
         prod = products[idx]
         name = prod.get("name") or prod.get("title") or f"Tool #{idx+1}"
-        price = float(prod.get("price") or prod.get("rate") or 0)
+        raw_price = float(prod.get("price") or prod.get("rate") or 0)
+        price = raw_price * USDT_TO_BDT
         p_id = prod.get("id") or prod.get("product_id") or idx
 
         user_balance = get_user_balance(user_id)
         if user_balance < price:
-            await query.edit_message_text(f"❌ পর্যাপ্ত ব্যালেন্স নেই! প্রয়োজন: ৳{price}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("➕ ব্যালেন্স যোগ করুন", callback_data="add_balance")]]))
+            await query.edit_message_text(f"❌ পর্যাপ্ত ব্যালেন্স নেই! প্রয়োজন: ৳{price:.2f}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("➕ ব্যালেন্স যোগ করুন", callback_data="add_balance")]]))
             return
 
         res = await api_client.place_order({"product_id": p_id, "quantity": 1})
@@ -466,14 +469,14 @@ async def handle_all_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
                            (user_id, str(p_id), name, price, str(res)))
             conn.commit()
             conn.close()
-            await query.edit_message_text(f"✅ API অর্ডার সফল হয়েছে!\nপ্রোডাক্ট: {name}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 মূল মেনু", callback_data="main_menu")]]))
+            await query.edit_message_text(f"✅ API অর্ডার সফল হয়েছে!\nপ্রোডাক্ট: {name}\nমূল্য: ৳{price:.2f}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 মূল মেনু", callback_data="main_menu")]]))
         else:
             err_msg = res.get("error", "API Rejected Order") if res else "API Connection Failed"
             await query.edit_message_text(f"❌ API অর্ডার ব্যর্থ হয়েছে:\n{err_msg}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 মূল মেনু", callback_data="main_menu")]]))
         return
 
     # =========================================================================
-    # ADMIN PANEL SECTION (Strict Server-Side Verification)
+    # ADMIN PANEL SECTION
     # =========================================================================
     if data == "admin_panel" or data.startswith("adm_"):
         if not is_admin:
@@ -535,7 +538,7 @@ async def handle_all_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
                 keyboard = [[InlineKeyboardButton("➕ Add Tool", callback_data="adm_add_tool")],
                             [InlineKeyboardButton("🔙 এডমিন মেনু", callback_data="admin_panel")]]
             else:
-                text = "📦 লোকাল টুলস ম্যানেজমেন্ট:\n(প্রোডাক্ট ডিলিট বা বন্ধ করতে নিচের বাটনে ক্লিক করুন)\n\n"
+                text = "📦 লোকাল টুলস ম্যানেজমেন্ট:\n\n"
                 keyboard = []
                 for p in prods:
                     text += f"ID: {p[0]} | {p[1]} | ৳{p[2]} | Stock: {p[3]} | [{p[4]}]\n"
@@ -587,18 +590,33 @@ async def handle_all_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
         elif data == "adm_manage_orders":
             conn = sqlite3.connect(DB_PATH)
             cursor = conn.cursor()
-            cursor.execute("SELECT order_id, user_id, product_name, amount, status FROM orders ORDER BY order_id DESC LIMIT 10")
+            cursor.execute("SELECT order_id, user_id, product_name, amount, status FROM orders ORDER BY order_id DESC LIMIT 8")
             orders = cursor.fetchall()
             conn.close()
 
-            text = "📋 সাম্প্রতিক ১০টি অর্ডার:\n\n"
+            text = "📋 সাম্প্রতিক অর্ডারসমূহ:\n(ইউজারকে মেসেজ পাঠাতে নিচের বাটনে ক্লিক করুন)\n\n"
+            keyboard = []
             if not orders:
                 text += "কোনো অর্ডার পাওয়া যায়নি।"
-            for o in orders:
-                text += f"#{o[0]} | User: {o[1]} | {o[2]} | ৳{o[3]} | [{o[4]}]\n"
+            else:
+                for o in orders:
+                    o_id, u_id, p_name, amt, status = o
+                    text += f"#{o_id} | User: `{u_id}` | {p_name} | ৳{amt}\n"
+                    keyboard.append([
+                        InlineKeyboardButton(f"✉️ Message User #{o_id} (ID: {u_id})", callback_data=f"adm_msg_user_{u_id}")
+                    ])
+            keyboard.append([InlineKeyboardButton("🔙 এডমিন মেনু", callback_data="admin_panel")])
+            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
-            keyboard = [[InlineKeyboardButton("🔙 এডমিন মেনু", callback_data="admin_panel")]]
-            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+        elif data.startswith("adm_msg_user_"):
+            target_user_id = int(data.split("_")[3])
+            context.user_data['msg_target_user'] = target_user_id
+            context.user_data['state'] = 'ADM_SEND_USER_MSG'
+            await query.edit_message_text(
+                f"✉️ ইউজার (`{target_user_id}`)-কে পাঠানোর জন্য আপনার মেসেজটি চ্যাট বক্সে লিখে পাঠান:",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 বাতিল", callback_data="adm_manage_orders")]]),
+                parse_mode="Markdown"
+            )
 
         elif data == "adm_manage_payments":
             conn = sqlite3.connect(DB_PATH)
@@ -634,6 +652,10 @@ async def handle_all_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
                 cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (amt, u_id))
                 conn.commit()
                 msg = f"✅ পেমেন্ট #{p_id} অ্যাপ্রুভ করা হয়েছে এবং ইউজার {u_id}-এর ব্যালেন্সে ৳{amt} যোগ হয়েছে!"
+                try:
+                    await context.bot.send_message(chat_id=u_id, text=f"🎉 আপনার ৳{amt} ডিপোজিট সফলভাবে অ্যাপ্রুভ করা হয়েছে!")
+                except Exception:
+                    pass
             else:
                 msg = "❌ পেমেন্টটি ইতিমধ্যে প্রসেস করা হয়েছে।"
             conn.close()
@@ -704,7 +726,7 @@ async def handle_all_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
             await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 # ---------------------------------------------------------------------------
-# UNIFIED TEXT INPUT HANDLER (State Machine - Never Gets Stuck)
+# UNIFIED TEXT INPUT HANDLER
 # ---------------------------------------------------------------------------
 async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
@@ -715,7 +737,6 @@ async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYP
     state = context.user_data.get('state')
 
     if not state:
-        await update.message.reply_text("মেনু দেখতে /start কমান্ড দিন।")
         return
 
     # --- USER DEPOSIT FLOW ---
@@ -753,7 +774,25 @@ async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYP
 
     # --- ADMIN FLOWS ---
     elif user_id == ADMIN_USER_ID:
-        if state == 'ADM_ADD_TOOL_NAME':
+        if state == 'ADM_SEND_USER_MSG':
+            target_u_id = context.user_data.get('msg_target_user')
+            context.user_data['state'] = None
+            try:
+                await context.bot.send_message(
+                    chat_id=target_u_id,
+                    text=f"📢 এডমিন থেকে মেসেজ:\n\n{text}"
+                )
+                await update.message.reply_text(
+                    f"✅ মেসেজটি সফলভাবে ইউজার (`{target_u_id}`)-কে পাঠানো হয়েছে!",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("👑 এডমিন প্যানেল", callback_data="admin_panel")]]),
+                    parse_mode="Markdown"
+                )
+            except Exception as e:
+                await update.message.reply_text(
+                    f"❌ মেসেজ পাঠানো যায়নি। ইউজার হয়তো বট ব্লক করে রেখেছেন বা চ্যাট শুরু করেননি।\nএরর: {e}",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("👑 এডমিন প্যানেল", callback_data="admin_panel")]]))
+
+        elif state == 'ADM_ADD_TOOL_NAME':
             context.user_data['new_name'] = text
             context.user_data['state'] = 'ADM_ADD_TOOL_DESC'
             await update.message.reply_text("📝 প্রোডাক্টের বিবরণ (Description) লিখুন:")
@@ -890,7 +929,7 @@ def main():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_messages))
 
     logger.info("Bot is starting and polling for updates...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    application.run_polling(allowed_types=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
