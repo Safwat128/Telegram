@@ -37,7 +37,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# CONFIGURATION & CREDENTIALS (Pre-configured as requested)
+# CONFIGURATION & CREDENTIALS
 # ---------------------------------------------------------------------------
 BOT_TOKEN = "8307223176:AAFj-2H86Ma6JmF_Zv1oYIPy0V3O15N-v5c"
 ADMIN_USER_ID = int("6551628383")
@@ -61,8 +61,8 @@ if not BOT_TOKEN:
     sys.exit(1)
 
 # Conversation states for Admin Actions & Balance
-ADD_TOOL_NAME, ADD_TOOL_DESC, ADD_TOOL_PRICE, ADD_TOOL_STOCK, ADD_TOOL_STATUS = range(5)
-ADD_BALANCE_AMOUNT = range(5, 6)
+ADD_TOOL_NAME, ADD_TOOL_DESC, ADD_TOOL_PRICE, ADD_TOOL_STOCK = range(4)
+ADD_BALANCE_AMOUNT = range(10, 11)
 
 # ---------------------------------------------------------------------------
 # DATABASE INITIALIZATION
@@ -73,7 +73,6 @@ def init_db():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
-    # Users & Wallet Balance
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
@@ -84,7 +83,6 @@ def init_db():
         )
     """)
     
-    # Local Products
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS local_products (
             product_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -97,7 +95,6 @@ def init_db():
         )
     """)
     
-    # Stock History
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS stock_history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -109,29 +106,16 @@ def init_db():
         )
     """)
     
-    # Local Orders
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS orders (
             order_id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
-            product_type TEXT, -- 'local' or 'external'
+            product_type TEXT,
             product_id INTEGER,
             product_name TEXT,
             amount REAL,
-            status TEXT, -- 'Pending', 'Completed', 'Rejected'
+            status TEXT,
             delivery_info TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    
-    # Transactions / Payments
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS transactions (
-            tx_id TEXT PRIMARY KEY,
-            user_id INTEGER,
-            amount REAL,
-            gateway TEXT,
-            status TEXT, -- 'Pending', 'Verified', 'Failed'
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
@@ -162,9 +146,8 @@ class ExternalAPIClient:
                 if response.status_code == 200:
                     data = response.json()
                     return data if isinstance(data, list) else data.get("products", [])
-                logger.error(f"External API /products error: Status {response.status_code}")
         except Exception as e:
-            logger.error(f"External API connection error for /products: {e}")
+            logger.error(f"External API error for /products: {e}")
         return None
 
     async def get_balance(self) -> Optional[Dict[str, Any]]:
@@ -174,24 +157,8 @@ class ExternalAPIClient:
                 response = await client.get(url, headers=self.headers)
                 if response.status_code == 200:
                     return response.json()
-                logger.error(f"External API /balance error: Status {response.status_code}")
         except Exception as e:
-            logger.error(f"External API connection error for /balance: {e}")
-        return None
-
-    async def place_order(self, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        url = f"{self.base_url}/order"
-        try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                response = await client.post(url, headers=self.headers, json=payload)
-                if response.status_code in [200, 201]:
-                    return response.json()
-                logger.error(f"External API /order error: Status {response.status_code} - {response.text}")
-        except httpx.TimeoutException:
-            logger.error("External API /order timed out.")
-            return {"status": "timeout", "message": "Order request timed out."}
-        except Exception as e:
-            logger.error(f"External API connection error for /order: {e}")
+            logger.error(f"External API error for /balance: {e}")
         return None
 
 api_client = ExternalAPIClient()
@@ -276,10 +243,7 @@ async def handle_main_menu_callbacks(update: Update, context: ContextTypes.DEFAU
     is_admin = (user_id == ADMIN_USER_ID)
 
     if data == "main_menu":
-        await query.edit_message_text(
-            "মূল মেনুতে স্বাগতম:", 
-            reply_markup=main_menu_keyboard(is_admin)
-        )
+        await query.edit_message_text("মূল মেনুতে স্বাগতম:", reply_markup=main_menu_keyboard(is_admin))
     
     elif data == "browse_products":
         conn = sqlite3.connect(DB_PATH)
@@ -340,8 +304,7 @@ async def handle_main_menu_callbacks(update: Update, context: ContextTypes.DEFAU
         else:
             text = "📦 **আপনার সাম্প্রতিক অর্ডারসমূহ:**\n\n"
             for o in orders:
-                o_id, p_name, amt, status, date = o
-                text += f"🆔 `#ORD-{o_id}` | {p_name} | ৳{amt} | স্ট্যাটাস: **{status}**\nতারিখ: {date}\n\n"
+                text += f"🆔 `#ORD-{o[0]}` | {o[1]} | ৳{o[2]} | স্ট্যাটাস: **{o[3]}**\nতারিখ: {o[4]}\n\n"
 
         keyboard = [[InlineKeyboardButton("🔙 ফিরে যান", callback_data="main_menu")]]
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
@@ -359,11 +322,7 @@ async def handle_main_menu_callbacks(update: Update, context: ContextTypes.DEFAU
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
     elif data == "how_to_use":
-        text = (
-            "ℹ️ **কীভাবে ব্যবহার করবেন:**\n\n"
-            "১. ওয়ালেটে ব্যালেন্স যোগ করুন বা ক্যাটালগ থেকে সরাসরি কিনুন।\n"
-            "২. 'Browse Products' বা 'Premium Tools' থেকে পছন্দের সার্ভিস সিলেক্ট করুন।"
-        )
+        text = "ℹ️ **কীভাবে ব্যবহার করবেন:**\n\n১. ওয়ালেটে ব্যালেন্স যোগ করুন বা ক্যাটালগ থেকে সরাসরি কিনুন।"
         keyboard = [[InlineKeyboardButton("🔙 ফিরে যান", callback_data="main_menu")]]
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
@@ -419,7 +378,6 @@ async def handle_buy_local(update: Update, context: ContextTypes.DEFAULT_TYPE):
         delivery_success = True
     except Exception as e:
         conn.rollback()
-        logger.error(f"Purchase failed: {e}")
         delivery_success = False
     finally:
         conn.close()
@@ -497,13 +455,6 @@ async def handle_admin_callbacks(update: Update, context: ContextTypes.DEFAULT_T
         keyboard = [[InlineKeyboardButton("🔙 এডমিন মেনু", callback_data="admin_panel")]]
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
-    elif data == "adm_add_tool":
-        await query.edit_message_text(
-            "➕ নতুন টুল যোগ করতে প্রোডাক্টের **নাম** লিখুন:",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 বাতিল", callback_data="admin_panel")]])
-        )
-        return ADD_TOOL_NAME
-
     elif data == "adm_manage_orders":
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
@@ -524,19 +475,35 @@ async def handle_admin_callbacks(update: Update, context: ContextTypes.DEFAULT_T
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 # ---------------------------------------------------------------------------
-# CONVERSATION HANDLERS
+# CONVERSATION HANDLERS (Fixed for Attribute Errors)
 # ---------------------------------------------------------------------------
+async def admin_add_tool_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.callback_query:
+        query = update.callback_query
+        await query.answer()
+        await query.edit_message_text(
+            "➕ নতুন টুল যোগ করতে প্রোডাক্টের **নাম** চ্যাট বক্সে লিখে পাঠান:",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 বাতিল", callback_data="admin_panel")]]
+        ))
+    return ADD_TOOL_NAME
+
 async def admin_add_tool_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
+        return ADD_TOOL_NAME
     context.user_data['new_tool_name'] = update.message.text
     await update.message.reply_text("প্রোডাক্টের বিবরণ (Description) লিখুন:")
     return ADD_TOOL_DESC
 
 async def admin_add_tool_desc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
+        return ADD_TOOL_DESC
     context.user_data['new_tool_desc'] = update.message.text
     await update.message.reply_text("প্রোডাক্টের বিক্রয়মূল্য সংখ্যায় লিখুন (যেমন: 250):")
     return ADD_TOOL_PRICE
 
 async def admin_add_tool_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
+        return ADD_TOOL_PRICE
     try:
         price = float(update.message.text)
         context.user_data['new_tool_price'] = price
@@ -547,6 +514,8 @@ async def admin_add_tool_price(update: Update, context: ContextTypes.DEFAULT_TYP
         return ADD_TOOL_PRICE
 
 async def admin_add_tool_stock(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
+        return ADD_TOOL_STOCK
     try:
         stock = int(update.message.text)
         name = context.user_data.get('new_tool_name')
@@ -573,6 +542,8 @@ async def admin_add_tool_stock(update: Update, context: ContextTypes.DEFAULT_TYP
         return ADD_TOOL_STOCK
 
 async def user_add_balance_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
+        return ADD_BALANCE_AMOUNT
     try:
         amount = float(update.message.text)
         if amount < 10 or amount > 50000:
@@ -589,7 +560,7 @@ async def user_add_balance_amount(update: Update, context: ContextTypes.DEFAULT_
 
 async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message:
-        await update.message.reply_text("অপারেশন বাতিল করা হয়েছে।", reply_markup=ReplyKeyboardRemove())
+        await update.message.reply_text("অপারেশন বাতিল করা হয়েছে.", reply_markup=ReplyKeyboardRemove())
     return ConversationHandler.END
 
 # ---------------------------------------------------------------------------
@@ -599,7 +570,7 @@ def main():
     application = Application.builder().token(BOT_TOKEN).build()
 
     add_tool_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(admin_add_tool_name, pattern="^adm_add_tool$")],
+        entry_points=[CallbackQueryHandler(admin_add_tool_start, pattern="^adm_add_tool$")],
         states={
             ADD_TOOL_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_tool_name)],
             ADD_TOOL_DESC: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_tool_desc)],
