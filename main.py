@@ -1,6 +1,6 @@
 """
 Production-Ready Telegram Bot for Digital Product Delivery & Secure Payments.
-Includes User Messaging from Admin Panel and USDT to BDT Converted Pricing.
+Includes User Messaging from Admin Panel, USDT to BDT Converted Pricing, and Fixed Telegram Polling.
 """
 
 import sys
@@ -236,7 +236,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     welcome_text = (
         f"স্বাগতম, {user.first_name}!\n\n"
-        "প্রিমিয়াম ডিজিটাল টুলস এবং সার্ভিসেস কিনতে নিচের মেনু থেকে আপনার প্রয়োজনীয় অপشنটি বেছে নিন:"
+        "প্রিমিয়াম ডিজিটাল টুলস এবং সার্ভিসেস কিনতে নিচের মেনু থেকে আপনার প্রয়োজনীয় অপশনটি বেছে নিন:"
     )
     
     if update.message:
@@ -295,7 +295,7 @@ async def handle_all_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
         for idx, prod in enumerate(products[:20]):
             name = prod.get("name") or prod.get("title") or f"Tool #{idx+1}"
             raw_price = float(prod.get("price") or prod.get("rate") or 0)
-            bdt_price = raw_price * USDT_TO_BDT  # USDT to BDT Conversion (1 USDT = 135 BDT)
+            bdt_price = raw_price * USDT_TO_BDT
             keyboard.append([InlineKeyboardButton(f"{name} - ৳{bdt_price:.2f}", callback_data=f"buy_ext_{idx}")])
         keyboard.append([InlineKeyboardButton("🔙 ফিরে যান", callback_data="main_menu")])
 
@@ -789,7 +789,7 @@ async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYP
                 )
             except Exception as e:
                 await update.message.reply_text(
-                    f"❌ মেসেজ পাঠানো যায়নি। ইউজার হয়তো বট ব্লক করে রেখেছেন বা চ্যাট শুরু করেননি।\nএরর: {e}",
+                    f"❌ মেসেজ পাঠানো যায়নি। ইউজার হয়তো বট ব্লক করে রেখেছেন বা চ্যাট শুরু করেননি。\nএরর: {e}",
                     reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("👑 এডমিন প্যানেল", callback_data="admin_panel")]]))
 
         elif state == 'ADM_ADD_TOOL_NAME':
@@ -913,7 +913,7 @@ async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYP
                 context.user_data['state'] = None
                 await update.message.reply_text(
                     f"✅ ইউজার {target_id}-এর ব্যালেন্স আপডেট করা হয়েছে!",
-                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("👑 এডমিন প্যানেল", callback_data="admin_panel")]])
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("👑 এডমিন প্যানেल", callback_data="admin_panel")]])
                 )
             except ValueError:
                 await update.message.reply_text("❌ সঠিক অ্যামাউন্ট সংখ্যায় লিখুন:")
@@ -929,7 +929,8 @@ def main():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_messages))
 
     logger.info("Bot is starting and polling for updates...")
-    application.run_polling(allowed_types=Update.ALL_TYPES)
+    # FIXED: changed 'allowed_types' to 'allowed_updates' for compatibility with python-telegram-bot v21+
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
