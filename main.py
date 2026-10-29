@@ -1,6 +1,6 @@
 """
 Production-Ready Telegram Bot with Supabase PostgreSQL Database,
-External API Integration, USDT to BDT Pricing, and Admin Controls.
+Fixed Database Queries, User Balances, and Product Management.
 """
 
 import sys
@@ -9,7 +9,6 @@ from typing import Optional, Dict, Any, List
 
 import httpx
 import psycopg2
-from psycopg2.extras import RealDictCursor
 from telegram import (
     Update,
     InlineKeyboardButton,
@@ -34,15 +33,12 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# CONFIGURATION & CREDENTIALS (Pre-configured)
+# CONFIGURATION & CREDENTIALS
 # ---------------------------------------------------------------------------
 BOT_TOKEN = "8307223176:AAFj-2H86Ma6JmF_Zv1oYIPy0V3O15N-v5c"
 ADMIN_USER_ID = 6551628383
 EXTERNAL_API_BASE_URL = "https://safwantigershopbot-production.up.railway.app/api"
 EXTERNAL_API_KEY = "stapi_ada749893e7a50de084870a8aaed5508390a5b067c0767ec270e740a8fd52c19"
-
-# Supabase PostgreSQL Database URL
-DATABASE_URL = "postgresql://postgres.zrvbpbslnuvnagtpbpsa:KW5DFquJJ5mPregz@aws-1-eu-central-1.pooler.supabase.com:5432/postgres"
 
 USDT_TO_BDT = 135.0  # 1 USDT = 135 BDT Conversion Rate
 
@@ -51,8 +47,10 @@ if not BOT_TOKEN:
     sys.exit(1)
 
 # ---------------------------------------------------------------------------
-# DATABASE INITIALIZATION (Supabase PostgreSQL)
+# DATABASE CONNECTION & INITIALIZATION
 # ---------------------------------------------------------------------------
+DATABASE_URL = "postgresql://postgres.zrvbpbslnuvnagtpbpsa:KW5DFquJJ5mPregz@aws-1-eu-central-1.pooler.supabase.com:5432/postgres"
+
 def get_db_connection():
     try:
         conn = psycopg2.connect(DATABASE_URL)
@@ -69,6 +67,7 @@ def init_db():
     
     cursor = conn.cursor()
     
+    # Independent tables with strict Primary Keys
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id BIGINT PRIMARY KEY,
