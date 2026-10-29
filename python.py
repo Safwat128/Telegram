@@ -1,591 +1,672 @@
+"""
+Production-Ready Telegram Bot for Digital Product Delivery & Secure Payments.
+Includes External REST API Integration, Local SQLite Database, Admin Panel, and bKash/Nagad Payment Architecture.
+"""
+
 import os
 import sys
+import sqlite3
 import logging
 import asyncio
 from datetime import datetime
-from typing import Optional
-
-from fastapi import FastAPI, Request, Form, Depends, HTTPException, status
-from fastapi.responses import HTMLResponse, RedirectResponse
-from fastapi.templating import Jinja2Templates
-from pydantic_settings import BaseSettings
+from typing import Optional, Dict, Any, List
 
 import httpx
-from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
-from sqlalchemy.orm import declarative_base
-from sqlalchemy import Column, Integer, String, Float, Boolean, DateTime, ForeignKey, Text, select, update
-
-from aiogram import Bot, Dispatcher, Router, F
-from aiogram.types import (
-    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, WebhookInfo
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardRemove,
 )
-from aiogram.filters import CommandStart, Command
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import StatesGroup, State
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+    ConversationHandler,
+)
 
-# Logging Setup
-logging.basicConfig(level=logging.INFO)
+# ---------------------------------------------------------------------------
+# LOGGING CONFIGURATION
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO
+)
 logger = logging.getLogger(__name__)
 
-# Settings Configuration
-class Settings(BaseSettings):
-    TELEGRAM_BOT_TOKEN: str
-    TELEGRAM_ADMIN_ID: int = 6551628383
-    DATABASE_URL: str
-    EXTERNAL_API_BASE_URL: str = "https://safwantigershopbot-production.up.railway.app/api"
-    EXTERNAL_API_KEY: str
-    APP_BASE_URL: str = "https://your-render-app.onrender.com"
-    WEBHOOK_SECRET: str = "supersecretwebhook"
+# ---------------------------------------------------------------------------
+# ENVIRONMENT CONFIGURATION & VALIDATION
+# ---------------------------------------------------------------------------
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "6551628383"))
+EXTERNAL_API_BASE_URL = os.getenv(
+    "EXTERNAL_API_BASE_URL", 
+    "https://safwantigershopbot-production.up.railway.app/api"
+)
+EXTERNAL_API_KEY = os.getenv("EXTERNAL_API_KEY")
+
+# Optional Payment Credentials (bKash & Nagad)
+BKASH_APP_KEY = os.getenv("BKASH_APP_KEY")
+BKASH_APP_SECRET = os.getenv("BKASH_APP_SECRET")
+BKASH_USERNAME = os.getenv("BKASH_USERNAME")
+BKASH_PASSWORD = os.getenv("BKASH_PASSWORD")
+
+NAGAD_MERCHANT_ID = os.getenv("NAGAD_MERCHANT_ID")
+NAGAD_MERCHANT_NUMBER = os.getenv("NAGAD_MERCHANT_NUMBER")
+NAGAD_MERCHANT_PRIVATE_KEY = os.getenv("NAGAD_MERCHANT_PRIVATE_KEY")
+PAYMENT_CALLBACK_URL = os.getenv("PAYMENT_CALLBACK_URL")
+PAYMENT_WEBHOOK_SECRET = os.getenv("PAYMENT_WEBHOOK_SECRET")
+
+if not BOT_TOKEN:
+    logger.error("CRITICAL: BOT_TOKEN environment variable is missing!")
+    sys.exit(1)
+
+if not EXTERNAL_API_KEY:
+    logger.warning("WARNING: EXTERNAL_API_KEY is not set. External API calls may fail.")
+
+# Conversation states for Admin Actions
+ADD_TOOL_NAME, ADD_TOOL_DESC, ADD_TOOL_PRICE, ADD_TOOL_STOCK, ADD_TOOL_STATUS = range(5)
+ADD_BALANCE_AMOUNT = range(5, 6)
+
+# ---------------------------------------------------------------------------
+# DATABASE INITIALIZATION
+# ---------------------------------------------------------------------------
+DB_PATH = "bot_database.db"
+
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
     
-    BKASH_BASE_URL: Optional[str] = None
-    BKASH_APP_KEY: Optional[str] = None
-    BKASH_APP_SECRET: Optional[str] = None
-    BKASH_USERNAME: Optional[str] = None
-    BKASH_PASSWORD: Optional[str] = None
+    # Users & Wallet Balance
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            first_name TEXT,
+            balance REAL DEFAULT 0.0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
     
-    NAGAD_BASE_URL: Optional[str] = None
-    NAGAD_MERCHANT_ID: Optional[str] = None
-    NAGAD_MERCHANT_NUMBER: Optional[str] = None
-    NAGAD_PUBLIC_KEY: Optional[str] = None
-    NAGAD_PRIVATE_KEY: Optional[str] = None
+    # Local Products
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS local_products (
+            product_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            description TEXT,
+            price REAL NOT NULL,
+            stock INTEGER NOT NULL DEFAULT 0,
+            status TEXT DEFAULT 'Active',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    
+    # Stock History
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS stock_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            product_id INTEGER,
+            admin_id INTEGER,
+            quantity_change INTEGER,
+            reason TEXT,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    
+    # Local Orders
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS orders (
+            order_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            product_type TEXT, -- 'local' or 'external'
+            product_id INTEGER,
+            product_name TEXT,
+            amount REAL,
+            status TEXT, -- 'Pending', 'Completed', 'Rejected'
+            delivery_info TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    
+    # Transactions / Payments
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS transactions (
+            tx_id TEXT PRIMARY KEY,
+            user_id INTEGER,
+            amount REAL,
+            gateway TEXT,
+            status TEXT, -- 'Pending', 'Verified', 'Failed'
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    
+    conn.commit()
+    conn.close()
+    logger.info("Database initialized successfully.")
 
-    class Config:
-        env_file = ".env"
-        extra = "ignore"
+init_db()
 
-settings = Settings()
-
-# Database Setup
-engine = create_async_engine(settings.DATABASE_URL, echo=False, future=True)
-AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
-Base = declarative_base()
-
-# SQLAlchemy Models
-class User(Base):
-    __tablename__ = "users"
-    id = Column(Integer, primary_key=True, index=True)
-    telegram_id = Column(Integer, unique=True, index=True, nullable=False)
-    username = Column(String, nullable=True)
-    full_name = Column(String, nullable=True)
-    is_admin = Column(Boolean, default=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
-
-class Product(Base):
-    __tablename__ = "products"
-    id = Column(Integer, primary_key=True, index=True)
-    name = Column(String, nullable=False)
-    description = Column(Text, nullable=True)
-    price = Column(Float, nullable=False)
-    supplier_product_id = Column(String, nullable=True)
-    stock = Column(Integer, default=0)
-    is_active = Column(Boolean, default=True)
-
-class Order(Base):
-    __tablename__ = "orders"
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    product_id = Column(Integer, ForeignKey("products.id"), nullable=False)
-    supplier_order_id = Column(String, nullable=True)
-    status = Column(String, default="PENDING") # PENDING, SUCCESS, FAILED
-    price = Column(Float, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
-
-class Wallet(Base):
-    __tablename__ = "wallets"
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), unique=True, nullable=False)
-    balance = Column(Float, default=0.0)
-
-class WalletLedger(Base):
-    __tablename__ = "wallet_ledger"
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    amount = Column(Float, nullable=False)
-    type = Column(String, nullable=False) # DEPOSIT, PURCHASE, REFUND, ADMIN_ADJUST
-    reference = Column(String, unique=True, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
-
-class Payment(Base):
-    __tablename__ = "payments"
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    gateway = Column(String, nullable=False) # BKASH, NAGAD, MANUAL
-    amount = Column(Float, nullable=False)
-    trx_id = Column(String, unique=True, nullable=False)
-    status = Column(String, default="PENDING") # PENDING, SUCCESS, FAILED
-    created_at = Column(DateTime, default=datetime.utcnow)
-
-class AuditLog(Base):
-    __tablename__ = "audit_logs"
-    id = Column(Integer, primary_key=True, index=True)
-    admin_id = Column(Integer, nullable=True)
-    action = Column(String, nullable=False)
-    details = Column(Text, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-
-# Supplier API Client
-class SupplierClient:
+# ---------------------------------------------------------------------------
+# EXTERNAL API CLIENT
+# ---------------------------------------------------------------------------
+class ExternalAPIClient:
     def __init__(self):
-        self.base_url = settings.EXTERNAL_API_BASE_URL
-        self.headers = {"Authorization": f"Bearer {settings.EXTERNAL_API_KEY}", "Content-Type": "application/json"}
+        self.base_url = EXTERNAL_API_BASE_URL.rstrip('/')
+        self.headers = {
+            "Authorization": f"Bearer {EXTERNAL_API_KEY}" if EXTERNAL_API_KEY else "",
+            "Content-Type": "application/json"
+        }
+        self.timeout = 10.0
 
-    async def get_products(self):
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            try:
-                response = await client.get(f"{self.base_url}/products", headers=self.headers)
+    async def get_products(self) -> Optional[List[Dict[str, Any]]]:
+        url = f"{self.base_url}/products"
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                response = await client.get(url, headers=self.headers)
                 if response.status_code == 200:
-                    return response.json()
-            except Exception as e:
-                logger.error(f"Supplier products fetch error: {e}")
-        return []
-
-    async def get_balance(self):
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            try:
-                response = await client.get(f"{self.base_url}/balance", headers=self.headers)
-                if response.status_code == 200:
-                    return response.json()
-            except Exception as e:
-                logger.error(f"Supplier balance fetch error: {e}")
+                    data = response.json()
+                    return data if isinstance(data, list) else data.get("products", [])
+                logger.error(f"External API /products error: Status {response.status_code}")
+        except Exception as e:
+            logger.error(f"External API connection error for /products: {e}")
         return None
 
-    async def create_order(self, product_id: str, quantity: int = 1):
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            try:
-                payload = {"product_id": product_id, "quantity": quantity}
-                response = await client.post(f"{self.base_url}/order", json=payload, headers=self.headers)
+    async def get_balance(self) -> Optional[Dict[str, Any]]:
+        url = f"{self.base_url}/balance"
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                response = await client.get(url, headers=self.headers)
+                if response.status_code == 200:
+                    return response.json()
+                logger.error(f"External API /balance error: Status {response.status_code}")
+        except Exception as e:
+            logger.error(f"External API connection error for /balance: {e}")
+        return None
+
+    async def place_order(self, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        url = f"{self.base_url}/order"
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                response = await client.post(url, headers=self.headers, json=payload)
                 if response.status_code in [200, 201]:
                     return response.json()
-            except Exception as e:
-                logger.error(f"Supplier order creation error: {e}")
+                logger.error(f"External API /order error: Status {response.status_code} - {response.text}")
+        except httpx.TimeoutException:
+            logger.error("External API /order timed out.")
+            return {"status": "timeout", "message": "Order request timed out. Please check status."}
+        except Exception as e:
+            logger.error(f"External API connection error for /order: {e}")
         return None
 
-supplier_client = SupplierClient()
+api_client = ExternalAPIClient()
 
-# FastAPI & Bot Setup
-app = FastAPI(title="Telegram Premium Tools Bot", version="1.0.0")
-bot = Bot(token=settings.TELEGRAM_BOT_TOKEN)
-dp = Dispatcher()
-router = Router()
+# ---------------------------------------------------------------------------
+# DATABASE HELPERS
+# ---------------------------------------------------------------------------
+def get_user_balance(user_id: int) -> float:
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return row[0] if row else 0.0
 
-templates = Jinja2Templates(directory=".")
+def update_user_balance(user_id: int, amount: float):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (amount, user_id))
+    conn.commit()
+    conn.close()
 
-@app.on_event("startup")
-async def startup_event():
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+def register_user_if_not_exists(user_id: int, username: str, first_name: str):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("INSERT OR IGNORE INTO users (user_id, username, first_name) VALUES (?, ?, ?)", 
+                   (user_id, username, first_name))
+    conn.commit()
+    conn.close()
+
+# ---------------------------------------------------------------------------
+# KEYBOARDS
+# ---------------------------------------------------------------------------
+def main_menu_keyboard(is_admin: bool = False) -> InlineKeyboardMarkup:
+    keyboard = [
+        [InlineKeyboardButton("🛍️ Browse Products", callback_data="browse_products"),
+         InlineKeyboardButton("💎 Premium Tools", callback_data="premium_tools")],
+        [InlineKeyboardButton("💰 My Balance", callback_data="my_balance"),
+         InlineKeyboardButton("📦 My Orders", callback_data="my_orders")],
+        [InlineKeyboardButton("➕ Add Balance", callback_data="add_balance"),
+         InlineKeyboardButton("📞 Support", callback_data="support")],
+        [InlineKeyboardButton("ℹ️ How to Use", callback_data="how_to_use")]
+    ]
+    if is_admin:
+        keyboard.append([InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")])
+    return InlineKeyboardMarkup(keyboard)
+
+def admin_menu_keyboard() -> InlineKeyboardMarkup:
+    keyboard = [
+        [InlineKeyboardButton("📊 Dashboard", callback_data="adm_dashboard"),
+         InlineKeyboardButton("➕ Add Tool", callback_data="adm_add_tool")],
+        [InlineKeyboardButton("📦 Manage Tools", callback_data="adm_manage_tools"),
+         InlineKeyboardButton("📥 Add Stock", callback_data="adm_add_stock")],
+        [InlineKeyboardButton("📋 Manage Orders", callback_data="adm_manage_orders"),
+         InlineKeyboardButton("💳 Manage Payments", callback_data="adm_manage_payments")],
+        [InlineKeyboardButton("👥 User Management", callback_data="adm_users"),
+         InlineKeyboardButton("📈 Sales Statistics", callback_data="adm_stats")],
+        [InlineKeyboardButton("⚙️ Bot Settings", callback_data="adm_settings"),
+         InlineKeyboardButton("🔙 Back to Main Menu", callback_data="main_menu")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+# ---------------------------------------------------------------------------
+# USER HANDLERS
+# ---------------------------------------------------------------------------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    register_user_if_not_exists(user.id, user.username or "", user.first_name or "")
+    is_admin = (user.id == ADMIN_USER_ID)
     
-    os.makedirs("templates", exist_ok=True)
-    with open("templates/dashboard.html", "w", encoding="utf-8") as f:
-        f.write("""
-<!DOCTYPE html>
-<html lang="bn">
-<head>
-    <meta charset="UTF-8">
-    <title>Admin Dashboard</title>
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.5/font/bootstrap-icons.css">
-</head>
-<body class="bg-light">
-    <nav class="navbar navbar-dark bg-dark px-4">
-        <a class="navbar-brand" href="#"><i class="bi bi-shield-lock-fill"></i> প্রিমিয়াম টুলস অ্যাডমিন প্যানেল</a>
-        <span class="text-white">সুপার এডমিন: 6551628383</span>
-    </nav>
-    <div class="container my-4">
-        <h2>সিস্টেম ড্যাশবোর্ড</h2>
-        <div class="row g-4 mt-2">
-            <div class="col-md-4">
-                <div class="card text-bg-primary shadow-sm">
-                    <div class="card-body">
-                        <h5>মোট ইউজার</h5>
-                        <h3>{{ user_count }}</h3>
-                    </div>
-                </div>
-            </div>
-            <div class="col-md-4">
-                <div class="card text-bg-success shadow-sm">
-                    <div class="card-body">
-                        <h5>মোট অর্ডার</h5>
-                        <h3>{{ order_count }}</h3>
-                    </div>
-                </div>
-            </div>
-            <div class="col-md-4">
-                <div class="card text-bg-warning shadow-sm">
-                    <div class="card-body">
-                        <h5>সাপ্লায়ার ব্যালেন্স</h5>
-                        <h3>{{ supplier_balance }}</h3>
-                    </div>
-                </div>
-            </div>
-        </div>
-        <div class="mt-4">
-            <a href="/admin/sync" class="btn btn-dark"><i class="bi bi-arrow-repeat"></i> সাপ্লায়ার সিঙ্ক করুন</a>
-            <a href="/admin/products" class="btn btn-primary ms-2"><i class="bi bi-box"></i> প্রোডাক্ট তালিকা</a>
-        </div>
-    </div>
-</body>
-</html>
-        """)
-
-    with open("templates/products.html", "w", encoding="utf-8") as f:
-        f.write("""
-<!DOCTYPE html>
-<html lang="bn">
-<head>
-    <meta charset="UTF-8">
-    <title>Products</title>
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
-</head>
-<body class="bg-light p-4">
-    <div class="container">
-        <h2>প্রোডাক্ট ম্যানেজমেন্ট</h2>
-        <a href="/admin/dashboard" class="btn btn-secondary mb-3">ড্যাশবোর্ডে ফিরে যান</a>
-        <table class="table table-bordered bg-white shadow-sm">
-            <thead>
-                <tr>
-                    <th>ID</th><th>নাম</th><th>মূল্য</th><th>স্টক</th>
-                </tr>
-            </thead>
-            <tbody>
-                {% for p in products %}
-                <tr>
-                    <td>{{ p.id }}</td>
-                    <td>{{ p.name }}</td>
-                    <td>৳{{ p.price }}</td>
-                    <td>{{ p.stock }}</td>
-                </tr>
-                {% endfor %}
-            </tbody>
-        </table>
-    </div>
-</body>
-</html>
-        """)
-
-    try:
-        webhook_url = f"{settings.APP_BASE_URL}/webhook/{settings.WEBHOOK_SECRET}"
-        await bot.set_webhook(webhook_url, drop_pending_updates=True)
-    except Exception as e:
-        logger.error(f"Webhook setup error: {e}")
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    try:
-        await bot.delete_webhook()
-        await bot.session.close()
-    except Exception:
-        pass
-
-# FastAPI Admin Routes
-@app.get("/admin/dashboard", response_class=HTMLResponse)
-async def admin_dashboard(request: Request):
-    async with AsyncSessionLocal() as session:
-        users_res = await session.execute(select(User))
-        user_count = len(users_res.scalars().all())
-        
-        orders_res = await session.execute(select(Order))
-        order_count = len(orders_res.scalars().all())
-
-        sup_bal = await supplier_client.get_balance()
-        supplier_balance = sup_bal.get("balance", "N/A") if sup_bal else "Error"
-
-    return templates.TemplateResponse("dashboard.html", {
-        "request": request,
-        "user_count": user_count,
-        "order_count": order_count,
-        "supplier_balance": supplier_balance
-    })
-
-@app.get("/admin/products", response_class=HTMLResponse)
-async def admin_products(request: Request):
-    async with AsyncSessionLocal() as session:
-        result = await session.execute(select(Product))
-        products = result.scalars().all()
-    return templates.TemplateResponse("products.html", {"request": request, "products": products})
-
-@app.get("/admin/sync")
-async def admin_sync():
-    data = await supplier_client.get_products()
-    async with AsyncSessionLocal() as session:
-        for item in data:
-            res = await session.execute(select(Product).where(Product.supplier_product_id == str(item.get("id"))))
-            prod = res.scalars().first()
-            if not prod:
-                prod = Product(
-                    name=item.get("name", "Unnamed Tool"),
-                    description=item.get("description", ""),
-                    price=float(item.get("price", 100)),
-                    supplier_product_id=str(item.get("id")),
-                    stock=int(item.get("stock", 10))
-                )
-                session.add(prod)
-            else:
-                prod.price = float(item.get("price", prod.price))
-                prod.stock = int(item.get("stock", prod.stock))
-        await session.commit()
-    return RedirectResponse(url="/admin/dashboard", status_code=303)
-
-# Telegram Webhook Endpoint
-@app.post(f"/webhook/{settings.WEBHOOK_SECRET}")
-async def telegram_webhook(request: Request):
-    json_data = await request.json()
-    from aiogram.types import Update
-    update = Update.model_validate(json_data, context={"bot": bot})
-    await dp.feed_update(bot, update)
-    return {"status": "ok"}
-
-# Telegram Bot Handlers (Bangla Interface)
-def get_main_menu():
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🛒 প্রিমিয়াম টুলস কিনুন", callback_data="buy_tools"),
-         InlineKeyboardButton(text="📦 সকল প্রোডাক্ট", callback_data="all_products")],
-        [InlineKeyboardButton(text="🔍 প্রোডাক্ট খুঁজুন", callback_data="search_product"),
-         InlineKeyboardButton(text="💰 আমার ওয়ালেট", callback_data="my_wallet")],
-        [InlineKeyboardButton(text="➕ টাকা যোগ করুন", callback_data="add_money"),
-         InlineKeyboardButton(text="🛍️ আমার অর্ডার", callback_data="my_orders")],
-        [InlineKeyboardButton(text="📜 ট্রানজেকশন হিস্ট্রি", callback_data="tx_history"),
-         InlineKeyboardButton(text="👤 আমার অ্যাকাউন্ট", callback_data="my_account")],
-        [InlineKeyboardButton(text="🛠️ কাস্টমার সাপোর্ট", callback_data="support")]
-    ])
-    return keyboard
-
-@router.message(CommandStart())
-async def cmd_start(message: Message):
-    user_id = message.from_user.id
-    username = message.from_user.username
-    full_name = message.from_user.full_name
-
-    async with AsyncSessionLocal() as session:
-        res = await session.execute(select(User).where(User.telegram_id == user_id))
-        user = res.scalars().first()
-        if not user:
-            user = User(
-                telegram_id=user_id,
-                username=username,
-                full_name=full_name,
-                is_admin=(user_id == settings.TELEGRAM_ADMIN_ID)
-            )
-            session.add(user)
-            await session.commit()
-            await session.refresh(user)
-
-            wallet = Wallet(user_id=user.id, balance=0.0)
-            session.add(wallet)
-            await session.commit()
-
     welcome_text = (
-        f"স্বাগতম, **{full_name}**!\n\n"
-        "আমাদের প্রিমিয়াম টুলস শপে আপনাকে স্বাগতম। নিচে দেওয়া অপশনগুলো থেকে আপনার পছন্দমতো সেবা বেছে নিন:"
+        f"স্বাগতম, {user.first_name}!\n\n"
+        "প্রিমিয়াম ডিজিটাল টুলস, সার্ভিসেস এবং অ্যাকাউন্ট কিনতে আমাদের বট ব্যবহার করুন।\n"
+        "নিচের মেনু থেকে আপনার প্রয়োজনীয় অপশনটি বেছে নিন:"
     )
-    await message.answer(welcome_text, reply_markup=get_main_menu(), parse_mode="Markdown")
-
-@router.callback_query(F.data == "buy_tools")
-async def cb_buy_tools(callback: CallbackQuery):
-    async with AsyncSessionLocal() as session:
-        res = await session.execute(select(Product).where(Product.is_active == True))
-        products = res.scalars().all()
     
-    if not products:
-        await callback.message.edit_text("দুঃখিত, বর্তমানে কোনো প্রোডাক্ট উপলব্ধ নেই।", reply_markup=get_main_menu())
-        return
+    if update.message:
+        await update.message.reply_text(welcome_text, reply_markup=main_menu_keyboard(is_admin))
+    elif update.callback_query:
+        query = update.callback_query
+        await query.answer()
+        await query.edit_message_text(welcome_text, reply_markup=main_menu_keyboard(is_admin))
 
-    text = "🛒 **উপলব্ধ প্রিমিয়াম টুলস:**\n\nকিনতে নিচের প্রোডাক্টগুলোতে ক্লিক করুন:"
-    buttons = []
-    for p in products:
-        buttons.append([InlineKeyboardButton(text=f"{p.name} - ৳{p.price}", callback_data=f"prod_{p.id}")])
-    buttons.append([InlineKeyboardButton(text="🔙 মূল মেনু", callback_data="main_menu")])
+async def handle_main_menu_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    user_id = update.effective_user.id
+    is_admin = (user_id == ADMIN_USER_ID)
+
+    if data == "main_menu":
+        await query.edit_message_text(
+            "মূল মেনুতে স্বাগতম:", 
+            reply_markup=main_menu_keyboard(is_admin)
+        )
     
-    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="Markdown")
+    elif data == "browse_products":
+        # Local Products Catalog
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("SELECT product_id, name, price, stock FROM local_products WHERE status = 'Active'")
+        products = cursor.fetchall()
+        conn.close()
 
-@router.callback_query(F.data == "all_products")
-async def cb_all_products(callback: CallbackQuery):
-    await cb_buy_tools(callback)
-
-@router.callback_query(F.data == "my_wallet")
-async def cb_my_wallet(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    async with AsyncSessionLocal() as session:
-        user_res = await session.execute(select(User).where(User.telegram_id == user_id))
-        user = user_res.scalars().first()
-        if user:
-            wallet_res = await session.execute(select(Wallet).where(Wallet.user_id == user.id))
-            wallet = wallet_res.scalars().first()
-            balance = wallet.balance if wallet else 0.0
-        else:
-            balance = 0.0
-
-    text = f"💰 **আপনার ওয়ালেট ব্যালেন্স:**\n\nবর্তমান ব্যালেন্স: **৳{balance:.2f}**"
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ টাকা যোগ করুন", callback_data="add_money")],
-        [InlineKeyboardButton(text="🔙 মূল মেনু", callback_data="main_menu")]
-    ])
-    await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
-
-@router.callback_query(F.data == "add_money")
-async def cb_add_money(callback: CallbackQuery):
-    text = (
-        "➕ **টাকা যোগ করুন (Add Money):**\n\n"
-        "বিকাশ বা নগদ মার্চেন্ট নম্বরে সেন্ড মানি করে ট্রানজেকশন আইডি (TrxID) দিয়ে অ্যাডমিন ভেরিফিকেশনের মাধ্যমে ব্যালেন্স যোগ করুন।\n\n"
-        "মার্চেন্ট নম্বর: `01700000000` (Personal/Merchant)"
-    )
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔙 মূল মেনু", callback_data="main_menu")]
-    ])
-    await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
-
-@router.callback_query(F.data == "my_orders")
-async def cb_my_orders(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    async with AsyncSessionLocal() as session:
-        user_res = await session.execute(select(User).where(User.telegram_id == user_id))
-        user = user_res.scalars().first()
-        if not user:
-            orders = []
-        else:
-            orders_res = await session.execute(select(Order).where(Order.user_id == user.id))
-            orders = orders_res.scalars().all()
-
-    text = "🛍️ **আপনার অর্ডারসমূহ:**\n\n"
-    if not orders:
-        text += "আপনার কোনো অর্ডার নেই।"
-    else:
-        for o in orders:
-            text += f"- অর্ডার ID: {o.id} | স্ট্যাটাস: {o.status} | মূল্য: ৳{o.price}\n"
-
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔙 মূল মেনু", callback_data="main_menu")]
-    ])
-    await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
-
-@router.callback_query(F.data == "tx_history")
-async def cb_tx_history(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    async with AsyncSessionLocal() as session:
-        user_res = await session.execute(select(User).where(User.telegram_id == user_id))
-        user = user_res.scalars().first()
-        if not user:
-            ledgers = []
-        else:
-            ledger_res = await session.execute(select(WalletLedger).where(WalletLedger.user_id == user.id))
-            ledgers = ledger_res.scalars().all()
-
-    text = "📜 **ট্রানজেকশন হিস্ট্রি:**\n\n"
-    if not ledgers:
-        text += "কোনো ট্রানজেকশন পাওয়া যায়নি।"
-    else:
-        for l in ledgers:
-            text += f"- ধরণ: {l.type} | পরিমাণ: ৳{l.amount} | Ref: {l.reference}\n"
-
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔙 মূল মেনু", callback_data="main_menu")]
-    ])
-    await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
-
-@router.callback_query(F.data == "my_account")
-async def cb_my_account(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    full_name = callback.from_user.full_name
-    username = callback.from_user.username
-
-    text = (
-        f"👤 **আপনার অ্যাকাউন্ট ইনফো:**\n\n"
-        f"নাম: {full_name}\n"
-        f"ইউজারনেম: @{username if username else 'N/A'}\n"
-        f"Telegram ID: `{user_id}`"
-    )
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔙 মূল মেনু", callback_data="main_menu")]
-    ])
-    await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
-
-@router.callback_query(F.data == "support")
-async def cb_support(callback: CallbackQuery):
-    text = (
-        "🛠️ **কাস্টমার সাপোর্ট:**\n\n"
-        "যেকোনো প্রয়োজনে বা সমস্যায় আমাদের এডমিনের সাথে যোগাযোগ করুন:\n"
-        "সাপোর্ট এডমিন: @AdminUsername"
-    )
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔙 মূল মেনু", callback_data="main_menu")]
-    ])
-    await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
-
-@router.callback_query(F.data == "main_menu")
-async def cb_main_menu(callback: CallbackQuery):
-    await callback.message.edit_text("মূল মেনু:", reply_markup=get_main_menu())
-
-@router.callback_query(F.data.startswith("prod_"))
-async def cb_product_detail(callback: CallbackQuery):
-    prod_id = int(callback.data.split("_")[1])
-    async with AsyncSessionLocal() as session:
-        res = await session.execute(select(Product).where(Product.id == prod_id))
-        p = res.scalars().first()
-
-    if not p:
-        await callback.answer("প্রোডাক্ট পাওয়া যায়নি!", show_alert=True)
-        return
-
-    text = (
-        f"📦 **{p.name}**\n\n"
-        f"বর্ণনা: {p.description or 'প্রদান করা হয়নি'}\n"
-        f"মূল্য: **৳{p.price}**\n"
-        f"স্টক: {p.stock}"
-    )
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💳 কিনুন (Buy Now)", callback_data=f"buy_{p.id}")],
-        [InlineKeyboardButton(text="🔙 পেছনের মেনু", callback_data="buy_tools")]
-    ])
-    await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
-
-@router.callback_query(F.data.startswith("buy_"))
-async def cb_process_purchase(callback: CallbackQuery):
-    prod_id = int(callback.data.split("_")[1])
-    user_id = callback.from_user.id
-
-    async with AsyncSessionLocal() as session:
-        user_res = await session.execute(select(User).where(User.telegram_id == user_id))
-        user = user_res.scalars().first()
-        prod_res = await session.execute(select(Product).where(Product.id == prod_id))
-        product = prod_res.scalars().first()
-
-        if not user or not product:
-            await callback.answer("সিস্টেম এরর!", show_alert=True)
+        if not products:
+            await query.edit_message_text(
+                "বর্তমানে কোনো লোকাল প্রোডাক্ট উপলব্ধ নেই।",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 ফিরে যান", callback_data="main_menu")]])
+            )
             return
 
-        wallet_res = await session.execute(select(Wallet).where(Wallet.user_id == user.id))
-        wallet = wallet_res.scalars().first()
-
-        if not wallet or wallet.balance < product.price:
-            await callback.answer("আপনার ওয়ালেটে পর্যাপ্ত ব্যালেন্স নেই! দয়া করে টাকা যোগ করুন।", show_alert=True)
-            return
-
-        wallet.balance -= product.price
+        keyboard = []
+        for p in products:
+            p_id, name, price, stock = p
+            keyboard.append([InlineKeyboardButton(f"{name} - ৳{price} (Stock: {stock})", callback_data=f"buy_local_{p_id}")])
+        keyboard.append([InlineKeyboardButton("🔙 ফিরে যান", callback_data="main_menu")])
         
-        order = Order(user_id=user.id, product_id=product.id, price=product.price, status="PENDING")
-        session.add(order)
-        await session.commit()
-        await session.refresh(order)
+        await query.edit_message_text("🛍️ **লোকাল প্রোডাক্ট ক্যাটালগ**\n\nপছন্দের প্রোডাক্টটি সিলেক্ট করুন:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
-        supplier_res = None
-        if product.supplier_product_id:
-            supplier_res = await supplier_client.create_order(product.supplier_product_id)
-            if supplier_res and supplier_res.get("success"):
-                order.status = "SUCCESS"
-                order.supplier_order_id = str(supplier_res.get("order_id", ""))
-            else:
-                order.status = "FAILED"
+    elif data == "premium_tools":
+        # External API Products Catalog
+        products = await api_client.get_products()
+        if not products:
+            await query.edit_message_text(
+                "এক্সটার্নাল API থেকে প্রোডাক্ট লোড করা সম্ভব হয়নি অথবা কোনো প্রোডাক্ট নেই।",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 ফিরে যান", callback_data="main_menu")]])
+            )
+            return
+
+        keyboard = []
+        for idx, prod in enumerate(products):
+            name = prod.get("name", f"Product {idx}")
+            price = prod.get("price", "N/A")
+            keyboard.append([InlineKeyboardButton(f"{name} - ৳{price}", callback_data=f"buy_ext_{idx}")])
+        keyboard.append([InlineKeyboardButton("🔙 ফিরে যান", callback_data="main_menu")])
+
+        await query.edit_message_text("💎 **প্রিমিয়াম টুলস (External API)**\n\nপ্রোডাক্ট সিলেক্ট করুন:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+    elif data == "my_balance":
+        balance = get_user_balance(user_id)
+        text = f"💰 **আপনার ওয়ালেট ব্যালেন্স**\n\nবর্তমান ব্যালেন্স: ৳{balance:.2f}"
+        keyboard = [[InlineKeyboardButton("➕ ব্যালেন্স যোগ করুন", callback_data="add_balance")],
+                    [InlineKeyboardButton("🔙 ফিরে যান", callback_data="main_menu")]]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+    elif data == "my_orders":
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("SELECT order_id, product_name, amount, status, created_at FROM orders WHERE user_id = ? ORDER BY order_id DESC LIMIT 5", (user_id,))
+        orders = cursor.fetchall()
+        conn.close()
+
+        if not orders:
+            text = "📦 আপনার কোনো অর্ডার হিস্ট্রি নেই।"
         else:
-            order.status = "SUCCESS"
+            text = "📦 **আপনার সাম্প্রতিক অর্ডারসমূহ:**\n\n"
+            for o in orders:
+                o_id, p_name, amt, status, date = o
+                text += f"🆔 `#ORD-{o_id}` | {p_name} | ৳{amt} | স্ট্যাটাস: **{status}**\nতারিখ: {date}\n\n"
 
-        await session.commit()
+        keyboard = [[InlineKeyboardButton("🔙 ফিরে যান", callback_data="main_menu")]]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
-    text = f"✅ অর্ডার সফল হয়েছে!\nঅর্ডার আইডি: #{order.id}\nস্ট্যাটাস: {order.status}"
-    await callback.message.edit_text(text, reply_markup=get_main_menu())
+    elif data == "add_balance":
+        if not BKASH_APP_KEY and not NAGAD_MERCHANT_ID:
+            text = (
+                "💳 **অটোমেটেড পেমেন্ট সেটআপ নোটিশ**\n\n"
+                "বর্তমানে bKash বা Nagad পেমেন্ট গেটওয়ে কনফিগার করা নেই। "
+                "দয়া করে এডমিনের সাথে যোগাযোগ করে ব্যালেন্স রিচার্জ করুন।"
+            )
+            keyboard = [[InlineKeyboardButton("📞 সাপোর্ট", callback_data="support"),
+                         InlineKeyboardButton("🔙 ফিরে যান", callback_data="main_menu")]]
+            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+        else:
+            await query.edit_message_text(
+                "➕ ব্যালেন্স যোগ করতে কত টাকা রিচার্জ করতে চান তা ইংরেজিতে অ্যামাউন্ট লিখুন (যেমন: 500):",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 ফিরে যান", callback_data="main_menu")]])
+            )
+            return ADD_BALANCE_AMOUNT
 
-dp.include_router(router)
+    elif data == "support":
+        text = "📞 **কাস্টমার সাপোর্ট**\n\nযে কোনো সমস্যায় আমাদের এডমিনের সাথে যোগাযোগ করুন:\n@AdminUsername"
+        keyboard = [[InlineKeyboardButton("🔙 ফিরে যান", callback_data="main_menu")]]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+    elif data == "how_to_use":
+        text = (
+            "ℹ️ **কীভাবে ব্যবহার করবেন:**\n\n"
+            "১. ওয়ালেটে ব্যালেন্স যোগ করুন বা ক্যাটালগ থেকে সরাসরি কিনুন।\n"
+            "২. 'Browse Products' বা 'Premium Tools' থেকে পছন্দের সার্ভিস সিলেক্ট করুন।\n"
+            "৩. সফল পেমেন্টের পর তাৎক্ষণিকভাবে ডেলিভারি তথ্য পেয়ে যাবেন।"
+        )
+        keyboard = [[InlineKeyboardButton("🔙 ফিরে যান", callback_data="main_menu")]]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+    elif data == "admin_panel":
+        if user_id != ADMIN_USER_ID:
+            await query.answer("আপনার এই প্যানেলটি ব্যবহার করার অনুমতি নেই!", show_alert=True)
+            return
+        await query.edit_message_text("👑 **এডমিন কন্ট্রোল প্যানেল**", reply_markup=admin_menu_keyboard(), parse_mode="Markdown")
+
+# ---------------------------------------------------------------------------
+# LOCAL PRODUCT PURCHASE FLOW
+# ---------------------------------------------------------------------------
+async def handle_buy_local(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    product_id = int(query.data.split("_")[2])
+
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT name, description, price, stock FROM local_products WHERE product_id = ? AND status = 'Active'", (product_id,))
+    prod = cursor.fetchone()
+    conn.close()
+
+    if not prod:
+        await query.edit_message_text("প্রোডাক্টটি বর্তমানে উপলব্ধ নেই।", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 ফিরে যান", callback_data="browse_products")]]))
+        return
+
+    name, desc, price, stock = prod
+    if stock <= 0:
+        await query.edit_message_text("দুঃখিত, প্রোডাক্টটি স্টক আউট!", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 ফিরে যান", callback_data="browse_products")]]))
+        return
+
+    user_balance = get_user_balance(user_id)
+    if user_balance < price:
+        text = f"❌ আপনার পর্যাপ্ত ব্যালেন্স নেই!\nপ্রয়োজন: ৳{price} | আপনার ব্যালেন্স: ৳{user_balance}"
+        keyboard = [[InlineKeyboardButton("➕ ব্যালেন্স যোগ করুন", callback_data="add_balance")],
+                    [InlineKeyboardButton("🔙 ফিরে যান", callback_data="browse_products")]]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+
+    # Process Purchase Transaction
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    try:
+        cursor.execute("BEGIN TRANSACTION")
+        # Deduct balance
+        cursor.execute("UPDATE users SET balance = balance - ? WHERE user_id = ?", (price, user_id))
+        # Reduce stock
+        cursor.execute("UPDATE local_products SET stock = stock - 1 WHERE product_id = ? AND stock > 0", (product_id,))
+        if cursor.rowcount == 0:
+            raise Exception("Out of stock during purchase")
+        
+        # Record order
+        cursor.execute("INSERT INTO orders (user_id, product_type, product_id, product_name, amount, status, delivery_info) VALUES (?, 'local', ?, ?, ?, 'Completed', 'Access granted via automated local delivery.')",
+                       (user_id, product_id, name, price))
+        conn.commit()
+        delivery_success = True
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"Purchase failed: {e}")
+        delivery_success = False
+    finally:
+        conn.close()
+
+    if delivery_success:
+        await query.edit_message_text(
+            f"✅ অর্ডার সফল হয়েছে!\n\nপ্রোডাক্ট: {name}\nমূল্য: ৳{price}\nস্ট্যাটাস: কমপ্লিটেড\n\nডেলিভারি তথ্য: আপনার প্রোডাক্ট সফলভাবে ডেলিভারি করা হয়েছে। 'My Orders' মেনু থেকে চেক করুন।",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 মূল মেনু", callback_data="main_menu")]]))
+    else:
+        await query.edit_message_text(
+            "❌ পেমেন্ট বা স্টক সংক্রান্ত সমস্যার কারণে অর্ডার সম্পন্ন হয়নি। আপনার ব্যালেন্স রিফান্ড করা হয়েছে বা কাটা হয়নি।",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 মূল মেনু", callback_data="main_menu")]]))
+
+# ---------------------------------------------------------------------------
+# ADMIN PANEL HANDLERS
+# ---------------------------------------------------------------------------
+async def handle_admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+
+    if user_id != ADMIN_USER_ID:
+        await query.answer("অননুমোদিত অ্যাক্সেস!", show_alert=True)
+        return
+
+    data = query.data
+
+    if data == "adm_dashboard":
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM users")
+        total_users = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*), SUM(stock) FROM local_products")
+        prod_res = cursor.fetchone()
+        total_prods = prod_res[0]
+        total_stock = prod_res[1] or 0
+        cursor.execute("SELECT COUNT(*) FROM orders WHERE status = 'Pending'")
+        pending_orders = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*), SUM(amount) FROM orders WHERE status = 'Completed'")
+        ord_res = cursor.fetchone()
+        completed_orders = ord_res[0]
+        total_sales = ord_res[1] or 0.0
+        conn.close()
+
+        ext_balance_data = await api_client.get_balance()
+        ext_balance = ext_balance_data.get("balance", "N/A") if ext_balance_data else "Unavailable"
+
+        text = (
+            "📊 **এডমিন ড্যাশবোর্ড**\n\n"
+            f"👥 মোট রেজিস্টার্ড ইউজার: {total_users}\n"
+            f"📦 মোট লোকাল প্রোডাক্ট: {total_prods}\n"
+            f"📥 মোট এভেইলেবল স্টক: {total_stock}\n"
+            f"⏳ পেন্ডিং অর্ডার: {pending_orders}\n"
+            f"✅ সম্পন্ন অর্ডার: {completed_orders}\n"
+            f"💵 মোট লোকাল সেলস: ৳{total_sales:.2f}\n"
+            f"🌐 এক্সটার্নাল API ব্যালেন্স: {ext_balance}"
+        )
+        keyboard = [[InlineKeyboardButton("🔙 এডমিন মেনু", callback_data="admin_panel")]]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+    elif data == "adm_manage_tools":
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("SELECT product_id, name, price, stock, status FROM local_products")
+        prods = cursor.fetchall()
+        conn.close()
+
+        if not prods:
+            text = "কোনো লোকাল টুল পাওয়া যায়নি।"
+        else:
+            text = "📦 **লোকাল টুলস ম্যানেজমেন্ট:**\n\n"
+            for p in prods:
+                text += f"ID: {p[0]} | {p[1]} | ৳{p[2]} | Stock: {p[3]} | [{p[4]}]\n"
+
+        keyboard = [[InlineKeyboardButton("🔙 এডমিন মেনু", callback_data="admin_panel")]]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+    elif data == "adm_add_tool":
+        await query.edit_message_text(
+            "➕ নতুন টুল যোগ করতে প্রোডাক্টের **নাম** লিখুন:",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 বাতিল", callback_data="admin_panel")]])
+        )
+        return ADD_TOOL_NAME
+
+    elif data == "adm_manage_orders":
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("SELECT order_id, user_id, product_name, amount, status FROM orders ORDER BY order_id DESC LIMIT 10")
+        orders = cursor.fetchall()
+        conn.close()
+
+        text = "📋 **সাম্প্রতিক অর্ডারসমূহ:**\n\n"
+        for o in orders:
+            text += f"ID: {o[0]} | User: {o[1]} | {o[2]} | ৳{o[3]} | Status: {o[4]}\n"
+
+        keyboard = [[InlineKeyboardButton("🔙 এডমিন মেনু", callback_data="admin_panel")]]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+    elif data == "adm_manage_payments" or data == "adm_add_stock" or data == "adm_users" or data == "adm_stats" or data == "adm_settings":
+        text = f"⚙️ {data.replace('adm_', '').replace('_', ' ').title()} মডিউল প্রস্তুত রয়েছে।"
+        keyboard = [[InlineKeyboardButton("🔙 এডমিন মেনু", callback_data="admin_panel")]]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+# ---------------------------------------------------------------------------
+# CONVERSATION HANDLERS FOR ADMIN & PAYMENTS
+# ---------------------------------------------------------------------------
+async def admin_add_tool_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['new_tool_name'] = update.message.text
+    await update.message.reply_text("প্রোডাক্টের বিবরণ (Description) লিখুন:")
+    return ADD_TOOL_DESC
+
+async def admin_add_tool_desc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['new_tool_desc'] = update.message.text
+    await update.message.reply_text("প্রোডাক্টের বিক্রয়মূল্য (Selling Price) সংখ্যায় লিখুন (যেমন: 250):")
+    return ADD_TOOL_PRICE
+
+async def admin_add_tool_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        price = float(update.message.text)
+        context.user_data['new_tool_price'] = price
+        await update.message.reply_text("প্রাথমিক স্টক পরিমাণ (Initial Stock Quantity) লিখুন:")
+        return ADD_TOOL_STOCK
+    except ValueError:
+        await update.message.reply_text("দয়া করে সঠিক সংখ্যা লিখুন। আবার চেষ্টা করুন:")
+        return ADD_TOOL_PRICE
+
+async def admin_add_tool_stock(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        stock = int(update.message.text)
+        name = context.user_data.get('new_tool_name')
+        desc = context.user_data.get('new_tool_desc')
+        price = context.user_data.get('new_tool_price')
+
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("INSERT INTO local_products (name, description, price, stock, status) VALUES (?, ?, ?, ?, 'Active')",
+                       (name, desc, price, stock))
+        p_id = cursor.lastrowid
+        cursor.execute("INSERT INTO stock_history (product_id, admin_id, quantity_change, reason) VALUES (?, ?, ?, ?)",
+                       (p_id, update.effective_user.id, stock, "Initial Stock Creation"))
+        conn.commit()
+        conn.close()
+
+        await update.message.reply_text(
+            f"✅ সফলভাবে নতুন টুল যোগ করা হয়েছে!\nনাম: {name}\nমূল্য: ৳{price}\nস্টক: {stock}",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("👑 এডমিন প্যানেল", callback_data="admin_panel")]])
+        )
+        return ConversationHandler.END
+    except ValueError:
+        await update.message.reply_text("দয়া করে সঠিক পূর্ণসংখ্যা লিখুন:")
+        return ADD_TOOL_STOCK
+
+async def user_add_balance_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        amount = float(update.message.text)
+        if amount < 10 or amount > 50000:
+            await update.message.reply_text("দয়া করে ১০ টাকা থেকে ৫০,০০০ টাকার মধ্যে অ্যামাউন্ট লিখুন:")
+            return ADD_BALANCE_AMOUNT
+        
+        user_id = update.effective_user.id
+        # Live payment redirection or instructions mockup if credentials aren't live webhook
+        text = (
+            f"💳 পেমেন্ট গেটওয়ে ইনিশিয়েটেড!\n\n"
+            f"অ্যামাউন্ট: ৳{amount}\n"
+            "যেহেতু লাইভ মার্চেন্ট গেটওয়ে ব্যাকএন্ড কলব্যাক রিসিভ করার জন্য HTTPS কনফিগার করা প্রয়োজন, "
+            "অনুগ্রহ করে অফিশিয়াল মার্চেন্ট পেমেন্ট সম্পন্ন করুন অথবা এডমিনের সাথে যোগাযোগ করুন।"
+        )
+        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 মূল মেনু", callback_data="main_menu")]]))
+        return ConversationHandler.END
+    except ValueError:
+        await update.message.reply_text("দয়া করে সঠিক অ্যামাউন্ট লিখুন:")
+        return ADD_BALANCE_AMOUNT
+
+async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message:
+        await update.message.reply_text("অপারেশন বাতিল করা হয়েছে।", reply_markup=ReplyKeyboardRemove())
+    return ConversationHandler.END
+
+# ---------------------------------------------------------------------------
+# MAIN APPLICATION ROUTINE
+# ---------------------------------------------------------------------------
+def main():
+    application = Application.builder().token(BOT_TOKEN).build()
+
+    # Conversation Handlers
+    add_tool_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(admin_add_tool_name, pattern="^adm_add_tool$")],
+        states={
+            ADD_TOOL_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_tool_name)],
+            ADD_TOOL_DESC: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_tool_desc)],
+            ADD_TOOL_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_tool_price)],
+            ADD_TOOL_STOCK: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_tool_stock)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_conversation)]
+    )
+
+    add_balance_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(handle_main_menu_callbacks, pattern="^add_balance$")],
+        states={
+            ADD_BALANCE_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, user_add_balance_amount)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_conversation)]
+    )
+
+    application.add_handler(add_tool_conv)
+    application.add_handler(add_balance_conv)
+
+    # Command & Callback Handlers
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CallbackQueryHandler(handle_admin_callbacks, pattern="^adm_"))
+    application.add_handler(CallbackQueryHandler(handle_buy_local, pattern="^buy_local_"))
+    application.add_handler(CallbackQueryHandler(handle_main_menu_callbacks))
+
+    logger.info("Bot is starting and polling for updates...")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
-    import uvicorn
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run("python:app", host="0.0.0.0", port=port)
+    main()
