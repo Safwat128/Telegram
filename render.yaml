@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: bdgate-webhook-bridge
+    env: python
+    buildCommand: echo bridge-no-build-needed
+    startCommand: python webhook_bridge.py
+    healthCheckPath: /health
+    envVars:
+      - key: BRIDGE_SECRET
+        sync: false
